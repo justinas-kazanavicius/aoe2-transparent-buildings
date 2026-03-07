@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# AI coding assistants
+CLAUDE.md
+.claude/
+.cursorrules
+.cursor/
+.aider*
+.codeium/
+.continue/
+.github/copilot-*
+.windsurf/
+
+# Test/build artifacts
+test_output/
+.pytest_cache/

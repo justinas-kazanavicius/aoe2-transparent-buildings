@@ -1,0 +1,32 @@
+[project]
+name = "aoe2-transparent-buildings"
+version = "0.1.0"
+description = "AoE2 DE mod that makes buildings semi-transparent using DXT1 checkerboard dithering"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.2",
+    "rich>=14.0.0",
+    "scipy>=1.17.0",
+]
+
+[project.scripts]
+build-mod = "build_mod:main"
+inspect-sld = "tools.inspect_sld:main"
+analyze-shape = "tools.analyze_shape:main"
+check-tiles = "tools.check_tiles:main"
+test-roundtrip = "tools.test_roundtrip:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
