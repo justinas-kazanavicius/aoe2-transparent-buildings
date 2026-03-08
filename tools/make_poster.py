@@ -136,10 +136,11 @@ def _downsample_2x(img):
             .astype(np.uint16).mean(axis=(1, 3)).astype(np.uint8))
 
 
-def _load_terrain_texture(terrain_type='grass'):
+def _load_terrain_texture(terrain_type='grass', scale='x1'):
     """Load an in-game terrain texture from AoE2 DE files.
 
     Textures in 2x/ are UHD scale and get downsampled to match x1 sprites.
+    For x2 scale, textures are used at native resolution.
     """
     game_dir = os.path.dirname(os.path.dirname(get_graphics_dir()))
     terrain_dir = os.path.join(game_dir, 'terrain', 'textures', '2x')
@@ -153,8 +154,8 @@ def _load_terrain_texture(terrain_type='grass'):
         path = os.path.join(terrain_dir, name)
         if os.path.exists(path):
             tex = _decode_dds_dxt1(path)
-            # Downsample from 2x to x1 scale if texture is large
-            if tex.shape[0] > 1024:
+            # Downsample from 2x to x1 scale only for x1
+            if scale == 'x1' and tex.shape[0] > 1024:
                 tex = _downsample_2x(tex)
             return tex
 
@@ -165,11 +166,15 @@ def _load_terrain_texture(terrain_type='grass'):
 _terrain_cache = {}
 
 
+_terrain_scale = 'x1'
+
+
 def _get_terrain(terrain_type='grass'):
     """Get terrain texture tile, cached."""
-    if terrain_type not in _terrain_cache:
-        print(f"  Loading {terrain_type} texture...")
-        tex = _load_terrain_texture(terrain_type)
+    key = (terrain_type, _terrain_scale)
+    if key not in _terrain_cache:
+        print(f"  Loading {terrain_type} texture ({_terrain_scale})...")
+        tex = _load_terrain_texture(terrain_type, _terrain_scale)
         if tex is None:
             # Fallback solid color
             fallback_colors = {'grass': (87, 122, 52), 'water': (40, 70, 120)}
@@ -177,8 +182,8 @@ def _get_terrain(terrain_type='grass'):
             tex = np.zeros((64, 64, 4), dtype=np.uint8)
             tex[:, :, :3] = color
             tex[:, :, 3] = 255
-        _terrain_cache[terrain_type] = tex
-    return _terrain_cache[terrain_type]
+        _terrain_cache[key] = tex
+    return _terrain_cache[key]
 
 
 def _fill_terrain(canvas, x, y, w, h, terrain_type='grass'):
@@ -276,40 +281,38 @@ def render_building(filepath, layer_type=None, frame_idx=0):
     return render_frame(sld.frames[frame_idx], layer_type)
 
 
-def render_wall_gate(gfx_dir, layer_type=None):
+def render_wall_gate(gfx_dir, layer_type=None, scale='x1'):
     """Render a wall+gate+wall composite.
 
-    Uses stone wall frame 3 (E-W direction) and stone gate E (closed).
+    Uses fortified wall frame 2 (tower) and fortified gate E (closed).
     Returns an RGBA canvas with the composite.
     """
-    gate_path = os.path.join(gfx_dir, 'b_west_gate_fortified_e_closed_x1.sld')
-    wall_path = os.path.join(gfx_dir, 'b_west_wall_fortified_x1.sld')
+    suffix = '_x1.sld' if scale == 'x1' else '_x2.sld'
+    gate_path = os.path.join(gfx_dir, f'b_west_gate_fortified_e_closed{suffix}')
+    wall_path = os.path.join(gfx_dir, f'b_west_wall_fortified{suffix}')
 
     gate = render_building(gate_path, layer_type, frame_idx=0)
     wall = render_building(wall_path, layer_type, frame_idx=2)
     if gate is None or wall is None:
         return None
 
-    # Gate center is at (200, 200) in 400x400 canvas
-    # Wall center is at (200, 200) in 400x400 canvas
-    # E-W walls connect horizontally; offset walls by ~190px each side
-    # with isometric vertical shift of ~24px per tile
-    # E gate = 2x1 tiles, wall frame 3 = ~2 tiles wide
-    # Tile step in isometric: dx=48, dy=24 per tile along U axis
-    # Offset wall centers by ~2 tiles from gate center
-    tile_dx = 140  # ~3 tiles * 48px
-    tile_dy = -20  # raise walls to align with gate
+    # Scale factor: x2 sprites are 2x larger
+    s = 2 if scale == 'x2' else 1
+    tile_dx = 140 * s
+    tile_dy = -20 * s
 
     # Canvas large enough for wall + gate + wall
-    cw = 800
-    ch = 400
+    cw = 800 * s
+    ch = 400 * s
     cx, cy = cw // 2, ch // 2  # composite center
 
     canvas = np.zeros((ch, cw, 4), dtype=np.uint8)
 
-    # Gate and wall centers in their own canvases
-    gate_cx, gate_cy = 200, 200
-    wall_cx, wall_cy = 200, 200
+    # Sprite centers (gate/wall canvases scale with sprite size)
+    gate_cx = gate.shape[1] // 2
+    gate_cy = gate.shape[0] // 2
+    wall_cx = wall.shape[1] // 2
+    wall_cy = wall.shape[0] // 2
 
     def place(sprite, sprite_cx, sprite_cy, dst_cx, dst_cy):
         """Place sprite on canvas aligning sprite center to dst center."""
@@ -382,10 +385,17 @@ def _resize(img, target_h, target_w):
     return result
 
 
-def make_poster(buildings, cols=2, output='poster.png', layer='main', target_size=None):
+def make_poster(buildings, cols=2, output='poster.png', layer='main', target_size=None, scale='x1', mod_dir=None):
     """Generate the poster image."""
+    global _terrain_scale
+    _terrain_scale = scale
     gfx = get_graphics_dir()
-    mod_gfx = get_mod_graphics_dir()
+    if mod_dir:
+        # Support both flat dirs and full mod structure
+        test_path = os.path.join(mod_dir, 'resources', '_common', 'drs', 'graphics')
+        mod_gfx = test_path if os.path.isdir(test_path) else mod_dir
+    else:
+        mod_gfx = get_mod_graphics_dir()
     layer_type = LAYER_BY_NAME[layer]
 
     # Render all pairs
@@ -397,9 +407,13 @@ def make_poster(buildings, cols=2, output='poster.png', layer='main', target_siz
             filename, name = entry[0], entry[1]
             terrain = 'grass'
 
+        # Swap x1 → x2 filenames when rendering at x2 scale
+        if scale == 'x2' and filename != 'wall_gate':
+            filename = filename.replace('_x1.sld', '_x2.sld')
+
         if filename == 'wall_gate':
-            orig = render_wall_gate(gfx, layer_type)
-            mod = render_wall_gate(mod_gfx, layer_type)
+            orig = render_wall_gate(gfx, layer_type, scale)
+            mod = render_wall_gate(mod_gfx, layer_type, scale)
         else:
             orig = render_building(os.path.join(gfx, filename), layer_type)
             mod = render_building(os.path.join(mod_gfx, filename), layer_type)
@@ -527,7 +541,12 @@ def make_poster(buildings, cols=2, output='poster.png', layer='main', target_siz
     poster[-bar_h:] = ((poster[-bar_h:].astype(np.float32) * 0.2)).astype(np.uint8)
     poster[-bar_h:, :, 3] = 255
 
-    save_png(poster, output)
+    if output.endswith('.png'):
+        save_png(poster, output, rgb=True)
+    else:
+        from PIL import Image
+        img = Image.fromarray(poster[:, :, :3])
+        img.save(output, quality=90)
     print(f"\nSaved poster to {output} ({poster_w}x{poster_h}, {len(pairs)} buildings)")
 
 
@@ -601,7 +620,7 @@ def _draw_arrow(canvas, cx, cy):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate before/after poster for mod page")
-    parser.add_argument('--output', '-o', default='exports/poster.png', help='Output filename')
+    parser.add_argument('--output', '-o', default='exports/poster.jpg', help='Output filename')
     parser.add_argument('--style', choices=list(STYLE_SETS.keys()),
                         help='Architecture style subset')
     parser.add_argument('--cols', type=int, default=4, help='Comparison pairs per row (default: 4)')
@@ -609,8 +628,11 @@ def main():
                         default='main', help='Layer to render')
     parser.add_argument('--buildings', nargs='+',
                         help='Specific SLD filenames to include')
-    parser.add_argument('--size', default='1920x1080',
-                        help='Output size WxH (default: 1920x1080, 16:9)')
+    parser.add_argument('--size', default='2560x1440',
+                        help='Output size WxH (default: 2560x1440, 16:9)')
+    parser.add_argument('--scale', choices=['x1', 'x2'], default='x1',
+                        help='Sprite scale: x1 (standard) or x2 (UHD)')
+    parser.add_argument('--mod-dir', help='Override mod directory path')
     args = parser.parse_args()
 
     parts = args.size.lower().split('x')
@@ -624,9 +646,14 @@ def main():
     else:
         buildings = SHOWCASE
 
-    print(f"Generating poster with {len(buildings)} buildings...")
-    make_poster(buildings, cols=args.cols, output=args.output, layer=args.layer,
-                target_size=target_size)
+    output = args.output
+    # Auto-name output for x2 scale
+    if args.scale == 'x2' and output == 'exports/poster.jpg':
+        output = 'exports/poster_x2.jpg'
+
+    print(f"Generating {args.scale} poster with {len(buildings)} buildings...")
+    make_poster(buildings, cols=args.cols, output=output, layer=args.layer,
+                target_size=target_size, scale=args.scale, mod_dir=args.mod_dir)
 
 
 if __name__ == '__main__':

@@ -92,16 +92,24 @@ def _write_png_chunk(f, chunk_type, data):
     f.write(struct.pack('>I', zlib.crc32(chunk_type + data) & 0xFFFFFFFF))
 
 
-def save_png(canvas, filepath):
-    """Save RGBA numpy array as PNG."""
-    h, w, _ = canvas.shape
+def save_png(canvas, filepath, rgb=False):
+    """Save numpy array as PNG. RGBA by default, RGB if rgb=True."""
+    h, w = canvas.shape[:2]
+    if rgb:
+        # Color type 2 = RGB
+        color_type = 2
+        img = canvas[:, :, :3] if canvas.shape[2] >= 3 else canvas
+    else:
+        # Color type 6 = RGBA
+        color_type = 6
+        img = canvas
     with open(filepath, 'wb') as f:
         f.write(b'\x89PNG\r\n\x1a\n')
-        _write_png_chunk(f, b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+        _write_png_chunk(f, b'IHDR', struct.pack('>IIBBBBB', w, h, 8, color_type, 0, 0, 0))
         raw = bytearray()
         for y in range(h):
             raw.append(0)
-            raw.extend(canvas[y].tobytes())
+            raw.extend(img[y].tobytes())
         _write_png_chunk(f, b'IDAT', zlib.compress(bytes(raw), 9))
         _write_png_chunk(f, b'IEND', b'')
 

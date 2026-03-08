@@ -1074,7 +1074,7 @@ def main():
                             ratio = new_size / orig_size if orig_size > 0 else 0
                             progress.console.print(
                                 f"  [green]OK[/] {filename}: "
-                                f"{orig_size:,} → {new_size:,} bytes ({ratio:.1%})")
+                                f"{orig_size:,} -> {new_size:,} bytes ({ratio:.1%})")
                             success += 1
                         progress.advance(task)
 

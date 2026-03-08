@@ -5,6 +5,7 @@ description = "AoE2 DE mod that makes buildings semi-transparent using DXT1 chec
 requires-python = ">=3.13"
 dependencies = [
     "numpy>=2.4.2",
+    "pillow>=11.0.0",
     "rich>=14.0.0",
 ]
 

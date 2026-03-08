@@ -4,7 +4,7 @@ A mod for Age of Empires II: Definitive Edition that makes buildings semi-transp
 
 The upper portion of each building sprite gets checkerboard dithering applied directly to the SLD graphics files, using DXT1's built-in transparency mode. The foundation/base of each building stays fully opaque, and a team-colored outline marks the building footprint on the ground.
 
-![Transparent Buildings](poster.png)
+![Transparent Buildings](poster.jpg)
 
 **Note:** Largely vibe-coded.
 
