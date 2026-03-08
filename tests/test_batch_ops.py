@@ -297,7 +297,7 @@ class TestProcessFrame:
         frame = self._make_test_frame(10, 20)
         original_blocks = [b[:] for b in frame.layers[0].blocks]
 
-        process_frame(frame, tile_hh=24, tiles=(2, 2), outline_enabled=False)
+        process_frame(frame, tile_hh=24, tiles=(2, 2), outline_enabled=False, edge_inset=0)
 
         main = get_layer(frame, LAYER_MAIN)
         # At least some blocks above the hotspot should be modified
@@ -336,7 +336,7 @@ class TestProcessFrame:
 
     def test_dithered_pixels_are_transparent(self):
         frame = self._make_test_frame(10, 20)
-        process_frame(frame, tile_hh=24, tiles=(2, 2), outline_enabled=False)
+        process_frame(frame, tile_hh=24, tiles=(2, 2), outline_enabled=False, edge_inset=0)
 
         main = get_layer(frame, LAYER_MAIN)
         positions = get_block_positions(main, frame)
@@ -410,7 +410,7 @@ class TestProcessFrame:
         frame.layers.append(shadow)
 
         original_shadow = [b[:] for b in shadow.blocks]
-        process_frame(frame, tile_hh=24, tiles=(2, 2), outline_enabled=False)
+        process_frame(frame, tile_hh=24, tiles=(2, 2), outline_enabled=False, edge_inset=0)
 
         # Shadow blocks above hotspot should be modified (zeroed where dithered)
         shadow_layer = get_layer(frame, LAYER_SHADOW)

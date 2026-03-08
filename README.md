@@ -87,7 +87,7 @@ uv run build-mod --file b_west_castle_age4_x1.sld
 | `--outline-thickness N` | Outline band height in pixels | 4 |
 | `--no-outline` | Disable foundation outline | off |
 | `--exclude [TYPE ...]` | Building types to exclude (e.g. `mill monastery`) | `mill` |
-| `--edge-inset N` | Pixels from building edge to keep opaque | 0 |
+| `--edge-inset N` | Pixels from building edge to keep opaque (auto-scaled 2x for UHD) | 3 |
 | `--gradient-height N` | Transition zone height above foundation | 0 |
 | `--tile-height N` | Override tile half-height in pixels | 24 (x1) / 48 (x2) |
 | `--output-dir DIR` | Override output directory | AoE2 local mods folder |
