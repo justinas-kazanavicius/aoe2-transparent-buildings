@@ -25,25 +25,17 @@ from tools.sld_to_png import render_frame, save_png, LAYER_BY_NAME
 # terrain: 'grass' (default) or 'water'
 # Grouped so similar buildings sit next to each other for comparison
 SHOWCASE = [
-    # Row 1: Castles - the biggest selling point
+    # Row 1: Castles - biggest selling point
     ('b_west_castle_age3_x1.sld', 'Castle', 'grass'),
     ('b_asia_castle_age3_x1.sld', 'Castle (East Asian)', 'grass'),
     ('b_east_castle_age3_x1.sld', 'Castle (Middle East)', 'grass'),
-    ('b_meso_castle_age3_x1.sld', 'Castle (Meso)', 'grass'),
-    # Row 2: Town Centers & Monasteries - tall, iconic
+    # Row 2: Key buildings
     ('b_west_town_center_age4_x1.sld', 'Town Center', 'grass'),
-    ('b_medi_town_center_age4_x1.sld', 'TC (Mediterranean)', 'grass'),
     ('b_west_monastery_age3_x1.sld', 'Monastery', 'grass'),
-    ('b_east_monastery_age3_x1.sld', 'Monastery (Middle East)', 'grass'),
-    # Row 3: Military buildings
-    ('b_west_barracks_age3_x1.sld', 'Barracks', 'grass'),
-    ('b_west_archery_range_age3_x1.sld', 'Archery Range', 'grass'),
-    ('b_west_stable_age3_x1.sld', 'Stable', 'grass'),
-    ('b_west_market_age3_x1.sld', 'Market', 'grass'),
-    # Row 4: Defenses, walls & dock
-    ('b_west_tower_age4_x1.sld', 'Keep', 'grass'),
     ('wall_gate', 'Wall + Gate', 'grass'),
-    ('b_west_house_age2_x1.sld', 'House', 'grass'),
+    # Row 3: Military & economy
+    ('b_west_barracks_age3_x1.sld', 'Barracks', 'grass'),
+    ('b_west_market_age3_x1.sld', 'Market', 'grass'),
     ('b_west_dock_age3_x1.sld', 'Dock', 'shore'),
 ]
 
@@ -623,7 +615,7 @@ def main():
     parser.add_argument('--output', '-o', default='exports/poster.jpg', help='Output filename')
     parser.add_argument('--style', choices=list(STYLE_SETS.keys()),
                         help='Architecture style subset')
-    parser.add_argument('--cols', type=int, default=4, help='Comparison pairs per row (default: 4)')
+    parser.add_argument('--cols', type=int, default=3, help='Comparison pairs per row (default: 3)')
     parser.add_argument('--layer', choices=['main', 'shadow', 'damage', 'playercolor'],
                         default='main', help='Layer to render')
     parser.add_argument('--buildings', nargs='+',

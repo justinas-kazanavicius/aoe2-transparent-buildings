@@ -438,13 +438,13 @@ class TestFindBuildingFiles:
         assert "b_west_house_age2_x1.sld" in files
         assert "b_west_gate_flag_x1.sld" not in files
 
-    def test_filters_mills_by_default(self, tmp_path, monkeypatch):
+    def test_includes_mills_by_default(self, tmp_path, monkeypatch):
         (tmp_path / "b_west_house_age2_x1.sld").touch()
         (tmp_path / "b_west_mill_age2_x1.sld").touch()
         monkeypatch.setattr("build_mod.get_graphics_dir", lambda: str(tmp_path))
         files = find_building_files()
         assert "b_west_house_age2_x1.sld" in files
-        assert "b_west_mill_age2_x1.sld" not in files
+        assert "b_west_mill_age2_x1.sld" in files
 
     def test_exclude_custom_building(self, tmp_path, monkeypatch):
         (tmp_path / "b_west_house_age2_x1.sld").touch()

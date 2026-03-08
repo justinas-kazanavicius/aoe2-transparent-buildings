@@ -192,6 +192,50 @@ def compute_outline_masks(block_xs, block_ys, center_x, center_y,
     return (on_outline.astype(np.uint32) * _BIT_VALUES[None, :]).sum(axis=1)
 
 
+def compute_animation_protection(sld, threshold=0.5):
+    """Compute per-block protection masks for animated blocks using delta encoding.
+
+    SLD animated sprites use delta encoding: frame 0 is a full frame, and
+    subsequent frames have flag1 bit 7 set, meaning "skip" commands copy from
+    the previous frame instead of being transparent. Only the CHANGED blocks
+    have draw commands in delta frames.
+
+    This function counts how often each block position appears as a draw block
+    across delta frames. Positions drawn frequently are continuously animated
+    (e.g. mill sails) and should be kept opaque.
+
+    Args:
+        sld: Parsed SLD object with multiple frames
+        threshold: Fraction of delta frames a block must be drawn in to be protected
+
+    Returns:
+        dict: (block_x, block_y) -> 0xFFFF protection mask for animated blocks
+    """
+    if sld.num_frames <= 1:
+        return {}
+
+    # Count how often each position appears as a draw block in delta frames
+    draw_counts = {}
+    num_delta = 0
+    for frame in sld.frames[1:]:
+        layer = get_layer(frame, LAYER_MAIN)
+        if layer is None or not (layer.flag1 & 0x80):
+            continue
+        num_delta += 1
+        positions = get_block_positions(layer, frame)
+        for _, bx, by in positions:
+            key = (bx, by)
+            draw_counts[key] = draw_counts.get(key, 0) + 1
+
+    if num_delta == 0:
+        return {}
+
+    # Protect positions drawn in >= threshold fraction of delta frames
+    min_draws = max(1, int(num_delta * threshold))
+    return {key: 0xFFFF for key, count in draw_counts.items()
+            if count >= min_draws}
+
+
 def compute_edge_protection(positions, edge_inset):
     """
     Compute per-block 16-bit masks of pixels within edge_inset of the silhouette edge.
@@ -434,7 +478,8 @@ def add_foundation_fill(frame, main_layer, margin, outline_value):
 
 def process_frame(frame, tile_hh, tiles, outline_value=200,
                   edge_inset=3, gradient_height=0, outline_thickness=4,
-                  outline_enabled=True):
+                  outline_enabled=True, animation_protection=None,
+                  full_positions=None):
     """
     Process a single SLD frame, applying dithering to layers.
 
@@ -447,6 +492,9 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         gradient_height: transition zone height above foundation line
         outline_thickness: outline band height in pixels
         outline_enabled: whether to draw foundation outline
+        animation_protection: dict of (bx, by) -> uint16 mask for animated pixels to keep opaque
+        full_positions: complete block positions from frame 0 (for stable edge
+            protection in delta frames). If None, uses the current frame's positions.
     """
     cx = frame.center_x
     cy = frame.center_y
@@ -481,14 +529,33 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         outline_masks = np.zeros(len(main_positions), dtype=np.uint32)
 
     # Edge protection: keep outermost pixels opaque based on silhouette boundary
+    # For delta frames, merge frame 0's positions with current frame's draw
+    # blocks so edge protection follows both the static body AND animated parts
     edge_prot_cache = {}
     if edge_inset > 0:
-        edge_prot_cache = compute_edge_protection(main_positions, edge_inset)
+        if full_positions and full_positions is not main_positions:
+            # Merge: frame 0 silhouette + current frame's draw blocks
+            full_set = {(bx, by) for _, bx, by in full_positions}
+            merged = list(full_positions)
+            for pos in main_positions:
+                if (pos[1], pos[2]) not in full_set:
+                    merged.append(pos)
+            edge_positions = merged
+        else:
+            edge_positions = main_positions
+        edge_prot_cache = compute_edge_protection(edge_positions, edge_inset)
         if edge_prot_cache:
             prot_array = np.array(
                 [edge_prot_cache.get((int(block_xs[i]), int(block_ys[i])), 0)
                  for i in range(len(main_positions))], dtype=np.uint32)
             masks &= ~prot_array
+
+    # Animation protection: keep changing pixels opaque across animation frames
+    if animation_protection:
+        anim_array = np.array(
+            [animation_protection.get((int(block_xs[i]), int(block_ys[i])), 0)
+             for i in range(len(main_positions))], dtype=np.uint32)
+        masks &= ~anim_array
 
     # Keep main layer opaque at outline pixels so team color shows through
     if outline_enabled:
@@ -526,7 +593,12 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                 block_outline_masks[int(block_idxs[i])] = om
         _force_opaque_dxt1_batch(main_layer, block_outline_masks)
 
-    if outline_enabled:
+    # Create new outline blocks only for full frames (not deltas).
+    # Delta frames inherit outline blocks from frame 0 via skip commands.
+    # Adding blocks to delta frames would corrupt the delta encoding.
+    is_delta = main_layer.flag1 & 0x80
+
+    if outline_enabled and not is_delta:
         # Create playercolor layer if frame doesn't have one (e.g. palisade)
         # so outline can show team color
         if get_layer(frame, LAYER_PLAYERCOLOR) is None and any(om for om in outline_pos_cache.values()):
@@ -676,6 +748,12 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                     [edge_prot_cache.get((int(u_array[i, 1]), int(u_array[i, 2])), 0)
                      for i in range(len(uncached))], dtype=np.uint32)
                 new_masks &= ~u_prot
+            # Apply animation protection to uncached masks
+            if animation_protection:
+                u_anim = np.array(
+                    [animation_protection.get((int(u_array[i, 1]), int(u_array[i, 2])), 0)
+                     for i in range(len(uncached))], dtype=np.uint32)
+                new_masks &= ~u_anim
             if layer_type == LAYER_PLAYERCOLOR:
                 new_outlines = compute_outline_masks(
                     u_array[:, 1], u_array[:, 2], cx, cy,
@@ -868,10 +946,24 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
     scaled_outline_thickness = outline_thickness * scale_factor
     scaled_gradient_height = gradient_height * scale_factor
 
+    # For animated sprites with delta encoding, get frame 0's full block
+    # positions for stable edge protection across all delta frames.
+    # Animation protection is not needed: delta encoding ensures dithering
+    # consistency — frame 0's dithered body persists via skip commands,
+    # and delta draw blocks get the same checkerboard pattern applied.
+    frame0_positions = None
+    if sld.num_frames > 1 and main_layer is not None:
+        for f in sld.frames[1:]:
+            l = get_layer(f, LAYER_MAIN)
+            if l and (l.flag1 & 0x80):
+                frame0_positions = get_block_positions(main_layer, sld.frames[0])
+                break
+
     for frame in sld.frames:
         process_frame(frame, tile_hh, tiles, outline_value, scaled_edge_inset,
                       scaled_gradient_height, scaled_outline_thickness,
-                      outline_enabled=outline_enabled)
+                      outline_enabled=outline_enabled,
+                      full_positions=frame0_positions)
 
     output_data = write_sld(sld)
 
@@ -899,7 +991,7 @@ def _process_file_worker(args):
         return (filename, 0, 0, str(e))
 
 
-DEFAULT_EXCLUDE = ['mill']
+DEFAULT_EXCLUDE = []
 
 def find_building_files(exclude=None):
     """

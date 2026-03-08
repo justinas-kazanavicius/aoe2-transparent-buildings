@@ -35,15 +35,26 @@ LAYER_NAMES = {
 
 LAYER_BY_NAME = {v: k for k, v in LAYER_NAMES.items()}
 
+EXPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'exports')
+
+
+def _export_path(filename):
+    """Return path inside exports/ directory, creating it if needed."""
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    return os.path.join(EXPORT_DIR, filename)
+
 # AoE2 DE runs at ~20fps for building animations
 DEFAULT_FPS = 20
 
 
-def render_frame(frame, layer_type=None):
+def render_frame(frame, layer_type=None, prev_canvas=None):
     """Render a frame to an RGBA numpy array.
 
     For DXT1 layers (main, damage), renders full RGBA.
     For BC4 layers (shadow, playercolor), renders as grayscale with alpha.
+
+    If prev_canvas is provided and the layer's flag1 has bit 7 set (delta
+    encoding), skipped blocks copy from prev_canvas instead of being transparent.
     """
     if layer_type is None:
         layer_type = LAYER_MAIN
@@ -55,7 +66,13 @@ def render_frame(frame, layer_type=None):
     w = frame.canvas_width
     h = frame.canvas_height
     is_dxt1 = layer_type in (LAYER_MAIN, LAYER_DAMAGE)
-    canvas = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # Delta frames start from previous frame; full frames start blank
+    is_delta = prev_canvas is not None and (layer.flag1 & 0x80)
+    if is_delta:
+        canvas = prev_canvas.copy()
+    else:
+        canvas = np.zeros((h, w, 4), dtype=np.uint8)
 
     positions = get_block_positions(layer, frame)
     for block_idx, bx, by in positions:
@@ -349,16 +366,31 @@ def make_sheet(canvases, cols=10):
     return sheet
 
 
+def render_accumulated_frame(sld, frame_idx, layer_type):
+    """Render a single frame with full delta accumulation from frame 0."""
+    prev = None
+    for i in range(frame_idx + 1):
+        canvas = render_frame(sld.frames[i], layer_type, prev_canvas=prev)
+        if canvas is not None:
+            prev = canvas
+    return prev
+
+
 def render_all_frames(sld, layer_type, max_frames=None):
-    """Render all (or up to max_frames) frames from an SLD."""
+    """Render all (or up to max_frames) frames from an SLD.
+
+    Handles delta-encoded frames by passing the previous canvas forward.
+    """
     limit = sld.num_frames
     if max_frames:
         limit = min(limit, max_frames)
     canvases = []
+    prev = None
     for i in range(limit):
-        canvas = render_frame(sld.frames[i], layer_type)
+        canvas = render_frame(sld.frames[i], layer_type, prev_canvas=prev)
         if canvas is not None:
             canvases.append(canvas)
+            prev = canvas
     return canvases
 
 
@@ -436,18 +468,18 @@ def main():
             mod_frames = render_all_frames(mod_sld, layer_type, args.max_frames)
             n = min(len(orig_frames), len(mod_frames))
             combined = [side_by_side(orig_frames[i], mod_frames[i]) for i in range(n)]
-            out = args.output or f"{basename}_compare.gif"
+            out = args.output or _export_path(f"{basename}_compare.gif")
             save_gif(combined, out, fps=args.fps)
             print(f"Saved {n}-frame comparison GIF to {out}")
         else:
             fi = args.frame
-            orig_canvas = render_frame(orig_sld.frames[fi], layer_type)
-            mod_canvas = render_frame(mod_sld.frames[fi], layer_type)
+            orig_canvas = render_accumulated_frame(orig_sld, fi, layer_type)
+            mod_canvas = render_accumulated_frame(mod_sld, fi, layer_type)
             if orig_canvas is None or mod_canvas is None:
                 print("Could not render frame.")
                 sys.exit(1)
             combined = side_by_side(orig_canvas, mod_canvas)
-            out = args.output or f"{basename}_compare_f{fi:03d}.png"
+            out = args.output or _export_path(f"{basename}_compare_f{fi:03d}.png")
             save_png(combined, out)
             print(f"Saved comparison to {out} ({combined.shape[1]}x{combined.shape[0]})")
         return
@@ -460,7 +492,7 @@ def main():
         if not canvases:
             print("No frames rendered.")
             sys.exit(1)
-        out = args.output or f"{basename}_{args.layer}.gif"
+        out = args.output or _export_path(f"{basename}_{args.layer}.gif")
         print(f"Encoding GIF...", end=" ", flush=True)
         save_gif(canvases, out, fps=args.fps)
         print(f"done.")
@@ -474,31 +506,29 @@ def main():
             print("No frames rendered.")
             sys.exit(1)
         sheet = make_sheet(canvases, cols=args.sheet_cols)
-        out = args.output or f"{basename}_{args.layer}_sheet.png"
+        out = args.output or _export_path(f"{basename}_{args.layer}_sheet.png")
         save_png(sheet, out)
         print(f"Saved {len(canvases)}-frame sheet to {out} ({sheet.shape[1]}x{sheet.shape[0]})")
         return
 
     # --all-frames: individual PNGs
     if args.all_frames:
-        limit = args.max_frames or sld.num_frames
-        for i in range(min(limit, sld.num_frames)):
-            canvas = render_frame(sld.frames[i], layer_type)
-            if canvas is not None:
-                out = f"{basename}_{args.layer}_f{i:03d}.png"
-                save_png(canvas, out)
-                print(f"  Frame {i} -> {out}")
-        print(f"Exported {min(limit, sld.num_frames)} frames.")
+        canvases = render_all_frames(sld, layer_type, args.max_frames)
+        for i, canvas in enumerate(canvases):
+            out = _export_path(f"{basename}_{args.layer}_f{i:03d}.png")
+            save_png(canvas, out)
+            print(f"  Frame {i} -> {out}")
+        print(f"Exported {len(canvases)} frames.")
         return
 
     # Single frame PNG (default)
     if args.frame >= sld.num_frames:
         print(f"Frame {args.frame} out of range (0-{sld.num_frames-1})")
         sys.exit(1)
-    canvas = render_frame(sld.frames[args.frame], layer_type)
+    canvas = render_accumulated_frame(sld, args.frame, layer_type)
     if canvas is None:
         sys.exit(1)
-    out = args.output or f"{basename}_{args.layer}_f{args.frame:03d}.png"
+    out = args.output or _export_path(f"{basename}_{args.layer}_f{args.frame:03d}.png")
     save_png(canvas, out)
     print(f"Saved {out} ({canvas.shape[1]}x{canvas.shape[0]})")
 

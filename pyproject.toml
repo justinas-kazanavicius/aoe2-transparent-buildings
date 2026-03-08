@@ -18,6 +18,7 @@ test-roundtrip = "tools.test_roundtrip:main"
 check-animations = "tools.check_animations:main"
 sld-to-png = "tools.sld_to_png:main"
 make-poster = "tools.make_poster:main"
+verify-dithering = "tools.verify_dithering:main"
 
 [build-system]
 requires = ["hatchling"]

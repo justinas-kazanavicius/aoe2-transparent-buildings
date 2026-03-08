@@ -32,9 +32,24 @@ def _find_mod_dir():
     if os.path.isdir(aoe2_base):
         # Find the first Steam ID subdirectory
         entries = glob.glob(os.path.join(aoe2_base, "*"))
-        for entry in sorted(entries):
-            if os.path.isdir(entry) and os.path.basename(entry).isdigit():
-                return os.path.join(entry, "mods", "local", "TransparentBuildings")
+        # Prefer real Steam ID profiles (long numeric) over "0".
+        # When multiple profiles exist, pick the one with a savegame dir
+        # containing the most files (most likely the active profile).
+        numeric_dirs = [e for e in entries
+                        if os.path.isdir(e) and os.path.basename(e).isdigit()
+                        and os.path.basename(e) != "0"]
+        if not numeric_dirs:
+            numeric_dirs = [e for e in entries
+                            if os.path.isdir(e) and os.path.basename(e) == "0"]
+        def _profile_weight(d):
+            sg = os.path.join(d, "savegame")
+            try:
+                return len(os.listdir(sg))
+            except OSError:
+                return 0
+        numeric_dirs.sort(key=_profile_weight, reverse=True)
+        for entry in numeric_dirs:
+            return os.path.join(entry, "mods", "local", "TransparentBuildings")
     return None
 
 
