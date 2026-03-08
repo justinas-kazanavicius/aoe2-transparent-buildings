@@ -28,7 +28,6 @@ from sld import (
     DXT1_LAYERS
 )
 from dxt import zero_bc4_pixels, decode_bc4_block, encode_bc4_block_from_flat, _ZERO_BLOCK
-from scipy.ndimage import distance_transform_edt
 from paths import get_graphics_dir, get_mod_dir, get_mod_graphics_dir
 
 # Prototype test file
@@ -227,11 +226,15 @@ def compute_edge_protection(positions, edge_inset):
         py = (by - min_by) + pad
         drawn[py:py+4, px:px+4] = True
 
-    # Euclidean distance from each drawn pixel to the nearest non-drawn pixel
-    dist = distance_transform_edt(drawn)
-
-    # Boundary = drawn pixels within edge_inset of the silhouette edge
-    boundary = drawn & (dist <= edge_inset)
+    # Find boundary pixels: drawn pixels within edge_inset of the silhouette edge.
+    # We erode the drawn mask by edge_inset and take the difference.
+    eroded = drawn.copy()
+    for _ in range(edge_inset):
+        inner = np.zeros_like(eroded)
+        inner[1:-1, 1:-1] = (eroded[:-2, 1:-1] & eroded[2:, 1:-1] &
+                              eroded[1:-1, :-2] & eroded[1:-1, 2:])
+        eroded = inner
+    boundary = drawn & ~eroded
 
     # Extract per-block 16-bit protection masks
     protection = {}
@@ -430,7 +433,7 @@ def add_foundation_fill(frame, main_layer, margin, outline_value):
 
 
 def process_frame(frame, tile_hh, tiles, outline_value=200,
-                  edge_inset=0, gradient_height=0, outline_thickness=4,
+                  edge_inset=3, gradient_height=0, outline_thickness=4,
                   outline_enabled=True):
     """
     Process a single SLD frame, applying dithering to layers.
@@ -822,7 +825,7 @@ def _force_opaque_dxt1_batch(layer, masks_dict):
 
 
 def process_file(input_path, output_path, tile_half_heights, tile_widths,
-                 outline_value=200, edge_inset=0, gradient_height=0,
+                 outline_value=200, edge_inset=3, gradient_height=0,
                  outline_thickness=4, no_outline=False):
     """
     Process a single SLD file, applying transparency dithering.
@@ -859,9 +862,15 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
     if outline_enabled and 'gate' in name_lower and _GATE_DIR_RE.search(name_lower):
         outline_enabled = False
 
+    # Scale pixel-based parameters for UHD (x2) resolution
+    scale_factor = 2 if scale == 'x2' else 1
+    scaled_edge_inset = edge_inset * scale_factor
+    scaled_outline_thickness = outline_thickness * scale_factor
+    scaled_gradient_height = gradient_height * scale_factor
+
     for frame in sld.frames:
-        process_frame(frame, tile_hh, tiles, outline_value, edge_inset,
-                      gradient_height, outline_thickness,
+        process_frame(frame, tile_hh, tiles, outline_value, scaled_edge_inset,
+                      scaled_gradient_height, scaled_outline_thickness,
                       outline_enabled=outline_enabled)
 
     output_data = write_sld(sld)
@@ -941,8 +950,8 @@ def main():
                         help='Number of parallel workers (default: CPU count)')
     parser.add_argument('--outline-value', type=int, default=200,
                         help='Brightness of foundation outline (0=off, 255=max, default: 200)')
-    parser.add_argument('--edge-inset', type=int, default=0,
-                        help='Pixels from building edge to keep opaque (default: 0)')
+    parser.add_argument('--edge-inset', type=int, default=3,
+                        help='Pixels from building edge to keep opaque, auto-scaled 2x for UHD (default: 3)')
     parser.add_argument('--gradient-height', type=int, default=0,
                         help='Transition zone height above foundation in pixels (default: 0)')
     parser.add_argument('--outline-thickness', type=int, default=4,
@@ -1009,6 +1018,9 @@ def main():
                         with open(input_path, 'rb') as f:
                             data = f.read()
                         sld = parse_sld(data)
+                        progress.console.print(
+                            f"  [green]OK[/] {filename}: "
+                            f"{sld.num_frames} frames, {len(data):,} bytes")
                         success += 1
                     except Exception as e:
                         progress.console.print(f"  [red]ERROR[/] {filename}: {e}")
@@ -1059,6 +1071,10 @@ def main():
                             progress.console.print(f"  [red]ERROR[/] {filename}: {error}")
                             errors += 1
                         else:
+                            ratio = new_size / orig_size if orig_size > 0 else 0
+                            progress.console.print(
+                                f"  [green]OK[/] {filename}: "
+                                f"{orig_size:,} → {new_size:,} bytes ({ratio:.1%})")
                             success += 1
                         progress.advance(task)
 
