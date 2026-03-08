@@ -23,3 +23,4 @@ CLAUDE.md
 # Test/build artifacts
 test_output/
 .pytest_cache/
+exports/
