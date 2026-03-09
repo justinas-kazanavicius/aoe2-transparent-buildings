@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 build-mod = "build_mod:main"
+gui = "gui:main"
 inspect-sld = "tools.inspect_sld:main"
 analyze-shape = "tools.analyze_shape:main"
 check-tiles = "tools.check_tiles:main"
@@ -33,4 +34,7 @@ testpaths = ["tests"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+]
+build = [
+    "pyinstaller>=6.0",
 ]
