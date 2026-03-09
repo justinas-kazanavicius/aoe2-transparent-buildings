@@ -40,17 +40,50 @@ All processing happens at the compressed block level — no full decode/re-encod
 
 ## Features
 
-- Checkerboard dithering on building upper portions
+- Configurable transparency (Bayer ordered dithering, 0–100%)
 - Isometric foundation diamond with team-colored outline
+- Building silhouette contour outlines
 - Edge protection to keep building silhouette edges opaque
 - Optional gradient transition zone near the foundation line
 - Per-building footprint sizes (1x1 outposts through 5x5 wonders, plus asymmetric gates)
+- Combine with other mods (reskins, flat buildings, etc.) with priority ordering
+- Building groups with per-group settings
 - Multiprocessing batch mode for processing all ~1775 building files
 - Round-trip verified SLD parser/writer (byte-identical output on unmodified files)
 
-## Getting started
+## GUI
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.13+.
+The easiest way to customize the mod is through the GUI.
+
+### Option 1: Download the exe (no install needed)
+
+Download `TransparentBuildings.exe` from the [latest release](../../releases/latest) and run it. No Python or other dependencies required.
+
+### Option 2: Run from source
+
+1. Install [uv](https://docs.astral.sh/uv/) and Python 3.13+
+2. Open a terminal in the project folder and run:
+
+```bash
+uv run gui
+```
+
+The GUI lets you:
+
+- **Preview** buildings before and after with live rendering
+- **Adjust settings** like transparency, outline brightness, edge inset, contour width
+- **Create building groups** with different settings per group
+- **Combine with other mods** — select from your installed local/subscribed mods, reorder by priority
+- **Save/load presets** for different configurations
+- **Build** with a progress bar and log output
+
+Game paths are auto-detected. If detection fails, set the environment variables described below.
+
+## Command line
+
+For scripting or automation, you can use the CLI directly.
+
+### Getting started
 
 ```bash
 uv sync
@@ -63,7 +96,7 @@ set AOE2_GRAPHICS_DIR=D:\SteamLibrary\steamapps\common\AoE2DE\resources\_common\
 set AOE2_MOD_DIR=C:\Users\YourName\Games\Age of Empires 2 DE\<steam_id>\mods\local\TransparentBuildings
 ```
 
-## Usage
+### Usage
 
 Build the mod (processes all buildings):
 
@@ -77,18 +110,29 @@ Process a single file:
 uv run build-mod --file b_west_castle_age4_x1.sld
 ```
 
+Combine with another mod:
+
+```bash
+uv run build-mod --combine-with "path/to/other/mod/root" "path/to/another/mod"
+```
+
 ### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--file FILE` | Process a specific SLD file | all buildings |
 | `--workers N` | Number of parallel workers | CPU count |
+| `--dither-intensity N` | Bayer dither intensity 0–16 (0=opaque, 8=50%, 16=fully transparent) | 8 |
+| `--dither-bottom` | Also dither below the foundation line | off |
 | `--outline-value N` | Foundation outline brightness (0-255) | 200 |
 | `--outline-thickness N` | Outline band height in pixels | 4 |
 | `--no-outline` | Disable foundation outline | off |
-| `--exclude [TYPE ...]` | Building types to exclude (e.g. `mill monastery`) | `mill` |
+| `--contour-width N` | Contour width around building silhouette (0=off) | 0 |
+| `--contour-color` | Contour color: `team` or `black` | team |
+| `--exclude [TYPE ...]` | Building types to exclude (e.g. `mill monastery`) | none |
 | `--edge-inset N` | Pixels from building edge to keep opaque (auto-scaled 2x for UHD) | 3 |
 | `--gradient-height N` | Transition zone height above foundation | 0 |
+| `--combine-with PATH...` | Mod root(s) to combine with (priority order) | none |
 | `--tile-height N` | Override tile half-height in pixels | 24 (x1) / 48 (x2) |
 | `--output-dir DIR` | Override output directory | AoE2 local mods folder |
 | `--dry-run` | Parse only, don't write files | off |
@@ -148,7 +192,8 @@ The test suite runs without game files — it uses synthetic SLD data.
 
 | File | Description |
 |------|-------------|
-| `build_mod.py` | Main mod builder: dithering, outlines, batch processing |
+| `gui.py` | Tkinter GUI for configuration, preview, and building |
+| `build_mod.py` | Core mod builder: dithering, outlines, batch processing |
 | `sld.py` | SLD file format parser and writer |
 | `dxt.py` | DXT1/BC4 block codec with fast transparency injection |
 | `paths.py` | Auto-detection of AoE2 DE install and mod directories |
