@@ -86,3 +86,45 @@ def get_mod_dir():
 def get_mod_graphics_dir():
     """Return the mod's graphics output directory path."""
     return os.path.join(get_mod_dir(), "resources", "_common", "drs", "graphics")
+
+
+def get_mods_root():
+    """Return the mods root directory (parent of local/ and subscribed/)."""
+    mod_dir = get_mod_dir()
+    # mod_dir is .../mods/local/TransparentBuildings, go up two levels
+    return os.path.dirname(os.path.dirname(mod_dir))
+
+
+def list_available_mods():
+    """List all available mods (local and subscribed), excluding TransparentBuildings.
+
+    Returns list of (display_name, mod_root) tuples for mods that have a
+    resources/ directory with at least one file. Includes mods with SLD,
+    SMX, or any other resource files.
+    Display name strips the leading numeric ID prefix from subscribed mods
+    (e.g. "469704_Transparent Buildings" -> "Transparent Buildings").
+    """
+    try:
+        mods_root = get_mods_root()
+    except FileNotFoundError:
+        return []
+
+    mods = []
+    for subdir in ('local', 'subscribed'):
+        parent = os.path.join(mods_root, subdir)
+        if not os.path.isdir(parent):
+            continue
+        for entry in sorted(os.listdir(parent)):
+            if entry == "TransparentBuildings":
+                continue
+            mod_root = os.path.join(parent, entry)
+            res_dir = os.path.join(mod_root, "resources")
+            if not os.path.isdir(res_dir):
+                continue
+            # Strip leading "12345_" ID prefix from subscribed mod names
+            display = entry.split('_', 1)[1] if '_' in entry and entry.split('_', 1)[0].isdigit() else entry
+            mods.append((display, mod_root))
+
+    # Sort by display name
+    mods.sort(key=lambda m: m[0].lower())
+    return mods

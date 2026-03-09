@@ -70,7 +70,8 @@ class TestApplyDXT1MasksBatch:
         block = _make_dxt1_block(0xFFFF, 0x0000, 0x00000000)  # opaque mode
         _, layer = _make_frame_with_main([block])
         _apply_dxt1_masks_batch(layer, {0: 0xFFFF})
-        assert layer.blocks[0] == b'\x00' * 8
+        # All-transparent: c0=0, c1=0 (transparent mode), all indices=3
+        assert layer.blocks[0] == b'\x00\x00\x00\x00\xff\xff\xff\xff'
 
     def test_partial_mask_transparent_mode(self):
         # Already in transparent mode (c0 <= c1)

@@ -28,6 +28,8 @@ from sld import (
     DXT1_LAYERS
 )
 from dxt import zero_bc4_pixels, decode_bc4_block, encode_bc4_block_from_flat, _ZERO_BLOCK
+import shutil
+
 from paths import get_graphics_dir, get_mod_dir, get_mod_graphics_dir
 
 # Prototype test file
@@ -117,6 +119,16 @@ _PIX_ROWS = np.array([r for r in range(4) for _ in range(4)], dtype=np.int32)
 _PIX_COLS = np.array([c for _ in range(4) for c in range(4)], dtype=np.int32)
 _BIT_VALUES = (1 << np.arange(16, dtype=np.uint32))
 
+# 4x4 Bayer ordered dithering threshold matrix (values 0-15)
+# For threshold T (0-16): pixel transparent if BAYER[r%4][c%4] < T
+# T=0 -> 0%, T=8 -> 50% (≈ checkerboard), T=16 -> 100%
+_BAYER_4x4 = np.array([
+    [ 0,  8,  2, 10],
+    [12,  4, 14,  6],
+    [ 3, 11,  1,  9],
+    [15,  7, 13,  5],
+], dtype=np.int32)
+
 # Precomputed: 16-bit dither mask -> 32-bit DXT1 index transparency pattern
 # Each set bit i in the 16-bit mask becomes 0b11 at bits 2i+1:2i (DXT1 index 3 = transparent)
 _MASK_EXPAND = np.zeros(65536, dtype=np.uint32)
@@ -125,18 +137,29 @@ for _j in range(16):
 
 
 def compute_dither_masks(block_xs, block_ys, center_x, center_y,
-                         margin_u, margin_v, gradient_height=0):
+                         margin_u, margin_v, gradient_height=0,
+                         dither_intensity=8, dither_bottom=False):
     """
     Vectorized computation of 16-bit dither masks for N blocks at once.
+
+    Uses a 4x4 Bayer ordered dithering matrix for variable transparency.
+    dither_intensity controls pixel density: 0=opaque, 8=50%, 16=fully transparent.
 
     The isometric diamond is defined by two constraints in rotated space:
       |dx/2 + dy| <= margin_u  AND  |-dx/2 + dy| <= margin_v
     Top edge = max of both lower bounds, bottom edge = min of both upper bounds.
     For square NxN, margin_u == margin_v and this reduces to the simple formula.
     """
+    if dither_intensity <= 0:
+        return np.zeros(len(block_xs), dtype=np.uint32)
+
     # Expand to per-pixel coordinates: (N, 16)
     pixel_ys = block_ys[:, None] + _PIX_ROWS[None, :]
     pixel_xs = block_xs[:, None] + _PIX_COLS[None, :]
+
+    # Bayer threshold: pixel is transparent if BAYER[r%4][c%4] < intensity
+    bayer_threshold = _BAYER_4x4[pixel_ys % 4, pixel_xs % 4]
+    bayer_pattern = bayer_threshold < dither_intensity
 
     # Isometric diamond edges from both constraints
     above_hotspot = pixel_ys < center_y
@@ -145,20 +168,35 @@ def compute_dither_masks(block_xs, block_ys, center_x, center_y,
     top_a = -margin_u - dx * 0.5  # from |dx/2 + dy| <= margin_u
     top_b = -margin_v + dx * 0.5  # from |-dx/2 + dy| <= margin_v
     foundation_y = center_y + np.maximum(top_a, top_b)
-    checkerboard = (pixel_xs + pixel_ys) % 2 == 0
+
+    # Bottom edge of the isometric diamond
+    bot_a = margin_u - dx * 0.5   # from |dx/2 + dy| <= margin_u
+    bot_b = margin_v + dx * 0.5   # from |-dx/2 + dy| <= margin_v
+    bottom_y = center_y + np.minimum(bot_a, bot_b)
+    below_foundation = pixel_ys >= bottom_y
 
     # Gradient zone: sparser dithering near the foundation line
     if gradient_height > 0:
         full_zone = pixel_ys < (foundation_y - gradient_height)
         in_gradient = ~full_zone & (pixel_ys < foundation_y)
-        sparse_checkerboard = (pixel_xs % 2 == 0) & (pixel_ys % 2 == 0)
-        dither = above_hotspot & (
-            (full_zone & checkerboard) |
-            (in_gradient & sparse_checkerboard)
+        # Sparse pattern uses half the main intensity
+        sparse_intensity = max(1, dither_intensity // 2)
+        sparse_pattern = bayer_threshold < sparse_intensity
+        above_dither = above_hotspot & (
+            (full_zone & bayer_pattern) |
+            (in_gradient & sparse_pattern)
         )
+        if dither_bottom:
+            dither = above_dither | (below_foundation & bayer_pattern)
+        else:
+            dither = above_dither
     else:
         above_foundation = pixel_ys < foundation_y
-        dither = above_hotspot & above_foundation & checkerboard
+        above_dither = above_hotspot & above_foundation & bayer_pattern
+        if dither_bottom:
+            dither = above_dither | (below_foundation & bayer_pattern)
+        else:
+            dither = above_dither
 
     # Pack boolean array into 16-bit masks
     return (dither.astype(np.uint32) * _BIT_VALUES[None, :]).sum(axis=1)
@@ -323,6 +361,108 @@ def inject_bc4_outline(block_data, mask_bits, value=200):
 
 
 
+def widen_layer_bounds(main_layer, frame, new_x1, new_x2):
+    """Expand main layer X bounds, remapping all layer commands to the new grid.
+
+    When offset_x1 or offset_x2 change, blocks_per_row changes, so existing
+    grid cursor positions need remapping to preserve their pixel coordinates.
+
+    This also remaps damage and playercolor layers which share main's grid.
+    """
+    old_x1 = main_layer.offset_x1
+    old_x2 = main_layer.offset_x2
+    old_w = old_x2 - old_x1
+    old_bpr = (old_w + 3) // 4
+
+    new_w = new_x2 - new_x1
+    new_bpr = (new_w + 3) // 4
+
+    if old_bpr == new_bpr and old_x1 == new_x1:
+        # No grid change needed, just update bounds
+        main_layer.offset_x1 = new_x1
+        main_layer.offset_x2 = new_x2
+        return
+
+    # Remap all layers that use main's grid
+    layers_to_remap = []
+    for layer in frame.layers:
+        if layer.layer_type in (LAYER_MAIN, LAYER_DAMAGE, LAYER_PLAYERCOLOR):
+            layers_to_remap.append(layer)
+
+    for layer in layers_to_remap:
+        if not layer.commands:
+            continue
+
+        # Decode existing blocks to pixel positions
+        old_positions = []  # (old_cursor, block_idx)
+        block_idx = 0
+        cursor = 0
+        for skip, draw in layer.commands:
+            cursor += skip
+            for _ in range(draw):
+                old_positions.append((cursor, block_idx))
+                block_idx += 1
+                cursor += 1
+
+        # Convert old cursor -> pixel -> new cursor
+        new_grid_blocks = {}  # new_cursor -> block_data
+        for old_cursor, bi in old_positions:
+            old_row = old_cursor // old_bpr
+            old_col = old_cursor % old_bpr
+            # Pixel position
+            px = old_x1 + old_col * 4
+            py = main_layer.offset_y1 + old_row * 4
+            # New grid position
+            new_col = (px - new_x1) // 4
+            new_row = (py - main_layer.offset_y1) // 4
+            new_cursor = new_row * new_bpr + new_col
+            new_grid_blocks[new_cursor] = layer.blocks[bi]
+
+        # Rebuild commands from new grid positions
+        sorted_positions = sorted(new_grid_blocks.keys())
+        if not sorted_positions:
+            continue
+
+        new_commands = []
+        new_blocks = []
+        prev_end = 0
+        i = 0
+
+        while i < len(sorted_positions):
+            pos = sorted_positions[i]
+            skip = pos - prev_end
+
+            while skip > 255:
+                new_commands.append((255, 0))
+                skip -= 255
+
+            # Find consecutive run
+            run_start = i
+            while (i < len(sorted_positions) - 1 and
+                   sorted_positions[i + 1] == sorted_positions[i] + 1):
+                i += 1
+            run_len = i - run_start + 1
+
+            drawn = 0
+            while drawn < run_len:
+                chunk = min(run_len - drawn, 255)
+                new_commands.append((skip if drawn == 0 else 0, chunk))
+                for j in range(run_start + drawn, run_start + drawn + chunk):
+                    new_blocks.append(new_grid_blocks[sorted_positions[j]])
+                drawn += chunk
+
+            prev_end = sorted_positions[i] + 1
+            i += 1
+
+        layer.commands = new_commands
+        layer.command_count = len(new_commands)
+        layer.blocks = new_blocks
+
+    # Update bounds
+    main_layer.offset_x1 = new_x1
+    main_layer.offset_x2 = new_x2
+
+
 def ensure_layer_blocks(layer, frame, needed_grid_positions, default_block=None):
     """
     Ensure a layer has blocks at the given grid positions.
@@ -479,7 +619,9 @@ def add_foundation_fill(frame, main_layer, margin, outline_value):
 def process_frame(frame, tile_hh, tiles, outline_value=200,
                   edge_inset=3, gradient_height=0, outline_thickness=4,
                   outline_enabled=True, animation_protection=None,
-                  full_positions=None):
+                  full_positions=None, dither_intensity=8,
+                  dither_bottom=False, contour_width=0,
+                  contour_color='team'):
     """
     Process a single SLD frame, applying dithering to layers.
 
@@ -520,7 +662,8 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
     block_ys = pos_array[:, 2]
 
     masks = compute_dither_masks(block_xs, block_ys, cx, cy,
-                                 margin_u, margin_v, gradient_height)
+                                 margin_u, margin_v, gradient_height,
+                                 dither_intensity, dither_bottom)
 
     if outline_enabled:
         outline_masks = compute_outline_masks(
@@ -561,6 +704,17 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
     if outline_enabled:
         masks &= ~outline_masks
 
+    # Contour: compute contour masks early so we can exclude from dithering
+    contour_pos_cache = {}
+    contour_cache = {}
+    if contour_width > 0:
+        contour_cache = compute_edge_protection(main_positions, contour_width) or {}
+        if contour_cache:
+            contour_array = np.array(
+                [contour_cache.get((int(block_xs[i]), int(block_ys[i])), 0)
+                 for i in range(len(main_positions))], dtype=np.uint32)
+            masks &= ~contour_array
+
     # Build lookup dicts
     block_dither_masks = {}   # block_idx -> mask_bits (for main layer)
     pos_mask_cache = {}       # (block_x, block_y) -> dither mask_bits (for all layers)
@@ -578,11 +732,12 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
             block_dither_masks[idx] = m
             any_dithered = True
 
-    if not any_dithered:
+    if not any_dithered and not contour_cache:
         return
 
     # Apply dithering to main graphic layer (DXT1)
-    _apply_dxt1_masks_batch(main_layer, block_dither_masks)
+    if any_dithered:
+        _apply_dxt1_masks_batch(main_layer, block_dither_masks)
 
     if outline_enabled:
         # Force outline pixels to opaque in main layer DXT1 blocks.
@@ -592,6 +747,17 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
             if om:
                 block_outline_masks[int(block_idxs[i])] = om
         _force_opaque_dxt1_batch(main_layer, block_outline_masks)
+
+    # Contour: force edge pixels to opaque in main layer + set playercolor
+    if contour_cache:
+        block_contour_masks = {}
+        for i in range(len(main_positions)):
+            key = (int(block_xs[i]), int(block_ys[i]))
+            cm = contour_cache.get(key, 0)
+            if cm:
+                block_contour_masks[int(block_idxs[i])] = cm
+                contour_pos_cache[key] = cm
+            _force_opaque_dxt1_batch(main_layer, block_contour_masks)
 
     # Create new outline blocks only for full frames (not deltas).
     # Delta frames inherit outline blocks from frame 0 via skip commands.
@@ -617,6 +783,16 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         # The foundation diamond may extend beyond drawn blocks (below the sprite,
         # at side corners, or in gaps). We need DXT1+BC4 blocks there so the
         # outline renders continuously around the entire diamond.
+
+        # Extend horizontal bounds if diamond left/right corners exceed them
+        diamond_left = cx - (margin_u + margin_v)
+        diamond_right = cx + (margin_u + margin_v)
+        new_x1 = min(main_layer.offset_x1, (diamond_left // 4) * 4)
+        new_x2 = max(main_layer.offset_x2, ((diamond_right + 3) // 4) * 4)
+        if new_x1 < main_layer.offset_x1 or new_x2 > main_layer.offset_x2:
+            widen_layer_bounds(main_layer, frame, new_x1, new_x2)
+            # Re-read positions after grid remap
+            main_positions = get_block_positions(main_layer, frame)
 
         # Extend vertical bounds if bottom diamond edge exceeds them
         bottom_edge_y = cy + max(margin_u, margin_v)
@@ -754,6 +930,12 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                     [animation_protection.get((int(u_array[i, 1]), int(u_array[i, 2])), 0)
                      for i in range(len(uncached))], dtype=np.uint32)
                 new_masks &= ~u_anim
+            # Exclude contour pixels from dithering
+            if contour_cache:
+                u_contour = np.array(
+                    [contour_cache.get((int(u_array[i, 1]), int(u_array[i, 2])), 0)
+                     for i in range(len(uncached))], dtype=np.uint32)
+                new_masks &= ~u_contour
             if layer_type == LAYER_PLAYERCOLOR:
                 new_outlines = compute_outline_masks(
                     u_array[:, 1], u_array[:, 2], cx, cy,
@@ -775,13 +957,26 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         if is_dxt1:
             _apply_dxt1_masks_batch(layer, layer_masks)
         elif layer_type == LAYER_PLAYERCOLOR:
-            # Player color: zero dithered pixels, then inject outline
+            # Player color: zero dithered pixels, then inject outline + contour
             for block_idx, mask in layer_masks.items():
                 layer.blocks[block_idx] = zero_bc4_pixels(
                     layer.blocks[block_idx], mask)
             for block_idx, omask in layer_outline_masks.items():
                 layer.blocks[block_idx] = inject_bc4_outline(
                     layer.blocks[block_idx], omask, outline_value)
+            # Contour: set edge pixels in playercolor
+            if contour_pos_cache:
+                # team=255 (full team color), black=0 (zero team color, shows base texture)
+                contour_pc_value = 255 if contour_color == 'team' else 0
+                for block_idx, block_x, block_y in positions:
+                    cm = contour_pos_cache.get((block_x, block_y), 0)
+                    if cm:
+                        if contour_color == 'team':
+                            layer.blocks[block_idx] = inject_bc4_outline(
+                                layer.blocks[block_idx], cm, contour_pc_value)
+                        else:
+                            layer.blocks[block_idx] = zero_bc4_pixels(
+                                layer.blocks[block_idx], cm)
         else:
             for block_idx, mask in layer_masks.items():
                 layer.blocks[block_idx] = zero_bc4_pixels(
@@ -798,9 +993,12 @@ def _apply_dxt1_masks_batch(layer, masks_dict):
     N = len(block_indices)
 
     # Handle all-transparent blocks (mask = 0xFFFF)
+    # DXT1 transparent mode: c0 <= c1, index 3 = transparent
+    # c0=0, c1=0, all indices = 3 (0xFF 0xFF 0xFF 0xFF)
+    _ALL_TRANSPARENT = b'\x00\x00\x00\x00\xff\xff\xff\xff'
     all_trans = mask_values == 0xFFFF
     for i in np.flatnonzero(all_trans):
-        layer.blocks[block_indices[i]] = _ZERO_BLOCK
+        layer.blocks[block_indices[i]] = _ALL_TRANSPARENT
 
     # Process partial transparency blocks in batch
     partial = ~all_trans
@@ -904,7 +1102,9 @@ def _force_opaque_dxt1_batch(layer, masks_dict):
 
 def process_file(input_path, output_path, tile_half_heights, tile_widths,
                  outline_value=200, edge_inset=3, gradient_height=0,
-                 outline_thickness=4, no_outline=False):
+                 outline_thickness=4, no_outline=False,
+                 dither_intensity=8, dither_bottom=False,
+                 contour_width=0, contour_color='team'):
     """
     Process a single SLD file, applying transparency dithering.
 
@@ -940,6 +1140,13 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
     if outline_enabled and 'gate' in name_lower and _GATE_DIR_RE.search(name_lower):
         outline_enabled = False
 
+    # Town Center front/back variants: fully transparent since units can
+    # only be blocked by the top quarter of the foundation
+    if 'town_center' in name_lower and ('_front' in name_lower or '_back' in name_lower):
+        dither_intensity = 16
+        dither_bottom = True
+        outline_enabled = False
+
     # Scale pixel-based parameters for UHD (x2) resolution
     scale_factor = 2 if scale == 'x2' else 1
     scaled_edge_inset = edge_inset * scale_factor
@@ -959,11 +1166,17 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
                 frame0_positions = get_block_positions(main_layer, sld.frames[0])
                 break
 
+    scaled_contour = contour_width * scale_factor
+
     for frame in sld.frames:
         process_frame(frame, tile_hh, tiles, outline_value, scaled_edge_inset,
                       scaled_gradient_height, scaled_outline_thickness,
                       outline_enabled=outline_enabled,
-                      full_positions=frame0_positions)
+                      full_positions=frame0_positions,
+                      dither_intensity=dither_intensity,
+                      dither_bottom=dither_bottom,
+                      contour_width=scaled_contour,
+                      contour_color=contour_color)
 
     output_data = write_sld(sld)
 
@@ -978,14 +1191,17 @@ def _process_file_worker(args):
     """Worker function for multiprocessing pool."""
     (input_path, output_path, tile_half_heights, tile_widths,
      outline_value, edge_inset, gradient_height, outline_thickness,
-     no_outline) = args
+     no_outline, dither_intensity, dither_bottom, contour_width,
+     contour_color) = args
     filename = os.path.basename(input_path)
     try:
         orig_size, new_size = process_file(input_path, output_path,
                                            tile_half_heights, tile_widths,
                                            outline_value, edge_inset,
                                            gradient_height, outline_thickness,
-                                           no_outline)
+                                           no_outline, dither_intensity,
+                                           dither_bottom, contour_width,
+                                           contour_color)
         return (filename, orig_size, new_size, None)
     except Exception as e:
         return (filename, 0, 0, str(e))
@@ -1050,10 +1266,22 @@ def main():
                         help='Foundation outline band height in pixels (default: 4)')
     parser.add_argument('--no-outline', action='store_true',
                         help='Disable foundation outline entirely')
+    parser.add_argument('--dither-intensity', type=int, default=8,
+                        help='Bayer dither intensity 0-16 (0=opaque, 8=50%%, 16=fully transparent, default: 8)')
+    parser.add_argument('--dither-bottom', action='store_true',
+                        help='Also dither below the foundation line')
+    parser.add_argument('--contour-width', type=int, default=0,
+                        help='Contour width in pixels around building silhouette (default: 0 = off)')
+    parser.add_argument('--contour-color', type=str, default='team', choices=['team', 'black'],
+                        help='Contour color: team color or black (default: team)')
     parser.add_argument('--exclude', type=str, nargs='*', default=None,
                         help='Building types to exclude (default: mill). Pass without args to exclude nothing.')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Override output directory')
+    parser.add_argument('--combine-with', type=str, nargs='+', default=None,
+                        help='Path(s) to other mod root directories to combine with. '
+                             'Building SLDs are read from these mods in order (first match wins, '
+                             'falling back to vanilla), and all resource files are copied through.')
     args = parser.parse_args()
 
     if args.tile_height is not None:
@@ -1066,6 +1294,20 @@ def main():
     # Create mod directory structure
     os.makedirs(output_graphics_dir, exist_ok=True)
 
+    combine_mod_roots = args.combine_with or []
+    for mr in combine_mod_roots:
+        if not os.path.isdir(mr):
+            print(f"Error: combine-with directory does not exist: {mr}")
+            return 1
+
+    # Derive graphics dirs from mod roots for building SLD resolution
+    gfx_subpath = os.path.join("resources", "_common", "drs", "graphics")
+    combine_gfx_dirs = []
+    for mr in combine_mod_roots:
+        gd = os.path.join(mr, gfx_subpath)
+        if os.path.isdir(gd):
+            combine_gfx_dirs.append(gd)
+
     exclude = args.exclude if args.exclude is not None else None
     if args.file:
         files = [args.file]
@@ -1075,8 +1317,12 @@ def main():
     print(f"Transparent Buildings Mod - Processing {len(files)} file(s)")
     graphics_dir = get_graphics_dir()
     print(f"  Input:  {graphics_dir}")
+    for mr in combine_mod_roots:
+        print(f"  Combine: {os.path.basename(mr)}")
     print(f"  Output: {output_graphics_dir}")
     print(f"  Tile half-height: {TILE_HALF_HEIGHT['x1']}px (x1), {TILE_HALF_HEIGHT['x2']}px (x2)")
+    print(f"  Dither intensity: {args.dither_intensity}/16 ({round(args.dither_intensity * 100 / 16)}%)")
+    print(f"  Dither bottom: {args.dither_bottom}")
     print(f"  Outline value: {args.outline_value}")
     print(f"  Edge inset: {args.edge_inset}px")
     print(f"  Gradient height: {args.gradient_height}px")
@@ -1091,6 +1337,14 @@ def main():
     tile_hh = dict(TILE_HALF_HEIGHT)
     tile_w = dict(TILE_WIDTH)
 
+    def _resolve_input(filename):
+        """Resolve input path: check combine graphics dirs in order, fall back to vanilla."""
+        for gd in combine_gfx_dirs:
+            combined = os.path.join(gd, filename)
+            if os.path.exists(combined):
+                return combined
+        return os.path.join(graphics_dir, filename)
+
     if args.dry_run:
         # Dry run: sequential, no output files
         with Progress(
@@ -1101,7 +1355,7 @@ def main():
         ) as progress:
             task = progress.add_task("Dry run...", total=len(files))
             for filename in files:
-                input_path = os.path.join(graphics_dir, filename)
+                input_path = _resolve_input(filename)
                 if not os.path.exists(input_path):
                     progress.console.print(f"  [yellow]SKIP[/] {filename} (not found)")
                     errors += 1
@@ -1122,7 +1376,7 @@ def main():
         # Build work items, skipping missing files
         work = []
         for filename in files:
-            input_path = os.path.join(graphics_dir, filename)
+            input_path = _resolve_input(filename)
             output_path = os.path.join(output_graphics_dir, filename)
             if not os.path.exists(input_path):
                 print(f"  SKIP {filename} (not found)")
@@ -1130,7 +1384,9 @@ def main():
                 continue
             work.append((input_path, output_path, tile_hh, tile_w,
                          args.outline_value, args.edge_inset, args.gradient_height,
-                         args.outline_thickness, args.no_outline))
+                         args.outline_thickness, args.no_outline,
+                         args.dither_intensity, args.dither_bottom,
+                         args.contour_width, args.contour_color))
 
         if len(work) == 1:
             # Single file: direct call, no pool overhead
@@ -1170,27 +1426,116 @@ def main():
                             success += 1
                         progress.advance(task)
 
+    # Copy resources from combined mods (later mods don't overwrite earlier ones)
+    copied = 0
+    if combine_mod_roots and not args.dry_run:
+        building_files = set(files)
+        mod_dir = get_mod_dir()
+        for mr in combine_mod_roots:
+            src_res = os.path.join(mr, "resources")
+            dst_res = os.path.join(mod_dir, "resources")
+            if not os.path.isdir(src_res):
+                continue
+            for dirpath, dirnames, filenames in os.walk(src_res):
+                rel = os.path.relpath(dirpath, src_res)
+                dst_dir = os.path.join(dst_res, rel)
+                os.makedirs(dst_dir, exist_ok=True)
+                for fn in filenames:
+                    dst_file = os.path.join(dst_dir, fn)
+                    # Skip building files we already processed
+                    if rel == os.path.join("_common", "drs", "graphics") and fn in building_files:
+                        continue
+                    # Don't overwrite files from earlier mods
+                    if os.path.exists(dst_file):
+                        continue
+                    shutil.copy2(os.path.join(dirpath, fn), dst_file)
+                    copied += 1
+
     elapsed = time.time() - start_time
     print()
+    if copied > 0:
+        print(f"Copied {copied} non-building file(s) from combined mod")
     print(f"Done in {elapsed:.1f}s: {success} succeeded, {errors} failed")
 
     if success > 0 and not args.dry_run:
-        # Create info.json for mod
-        info_path = os.path.join(get_mod_dir(), "info.json")
-        if not os.path.exists(info_path):
-            import json
-            info = {
-                "Title": "Transparent Buildings",
-                "Description": "See through buildings! The upper part of every building becomes see-through so you can spot units and holes hiding behind them. The foundation stays solid.",
-                "Author": "Yustee",
-                "Version": "1.0"
-            }
-            with open(info_path, 'w') as f:
-                json.dump(info, f, indent=2)
-            print(f"Created mod info: {info_path}")
+        # Write info.json for mod
+        import json
+        mod_dir = get_mod_dir()
+        info_path = os.path.join(mod_dir, "info.json")
+        info = {
+            "Title": "Transparent Buildings",
+            "Description": (
+                "See through buildings! The upper part of every building "
+                "becomes semi-transparent using a checkerboard dither pattern, "
+                "letting you spot units hiding behind them. The foundation "
+                "stays solid with a team-color diamond outline so you can "
+                "still see building footprints clearly. Works with all "
+                "civilizations, animated buildings (mills, folwarks), and "
+                "both standard and UHD graphics."
+            ),
+            "Author": "Yustee",
+            "CacheStatus": 0,
+        }
+        with open(info_path, 'w') as f:
+            json.dump(info, f)
+        print(f"Wrote mod info: {info_path}")
+
+        # Generate thumbnail if castle was built
+        thumb_path = os.path.join(mod_dir, "thumbnail.png")
+        showcase = "b_west_castle_age3_x1.sld"
+        orig_file = os.path.join(graphics_dir, showcase)
+        mod_file = os.path.join(output_graphics_dir, showcase)
+        if os.path.exists(orig_file) and os.path.exists(mod_file):
+            try:
+                _generate_thumbnail(orig_file, mod_file, thumb_path)
+                print(f"Wrote thumbnail: {thumb_path}")
+            except Exception as e:
+                print(f"Thumbnail generation failed: {e}")
 
     return 0 if errors == 0 else 1
 
 
+def _generate_thumbnail(orig_path, mod_path, out_path, width=1280, height=720):
+    """Generate a before/after thumbnail for the mod."""
+    from sld import LAYER_MAIN
+    from tools.sld_to_png import render_frame, save_png
+
+    with open(orig_path, 'rb') as f:
+        orig_sld = parse_sld(f.read())
+    with open(mod_path, 'rb') as f:
+        mod_sld = parse_sld(f.read())
+
+    orig = render_frame(orig_sld.frames[0], LAYER_MAIN)
+    modded = render_frame(mod_sld.frames[0], LAYER_MAIN)
+
+    thumb = np.zeros((height, width, 4), dtype=np.uint8)
+    thumb[:, :, 0] = 45
+    thumb[:, :, 1] = 65
+    thumb[:, :, 2] = 30
+    thumb[:, :, 3] = 255
+
+    # Divider
+    thumb[:, width // 2 - 1:width // 2 + 1, :3] = 200
+
+    half_w = width // 2
+    for canvas, x_base in [(orig, 0), (modded, half_w)]:
+        ch, cw = canvas.shape[:2]
+        y0 = max(0, (height - ch) // 2 + 20)
+        x0 = x_base + max(0, (half_w - cw) // 2)
+        yend = min(y0 + ch, height)
+        xend = min(x0 + cw, width)
+        sh = yend - y0
+        sw = xend - x0
+        alpha = canvas[:sh, :sw, 3:4].astype(np.float32) / 255.0
+        thumb[y0:yend, x0:xend, :3] = (
+            canvas[:sh, :sw, :3] * alpha +
+            thumb[y0:yend, x0:xend, :3] * (1 - alpha)
+        ).astype(np.uint8)
+
+    save_png(thumb, out_path, rgb=True)
+
+
 if __name__ == '__main__':
+    from multiprocessing import freeze_support
+    freeze_support()
     sys.exit(main())
