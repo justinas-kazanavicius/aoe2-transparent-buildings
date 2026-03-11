@@ -97,10 +97,14 @@ def get_building_tiles(filename, layer_w, tile_w):
         m = _GATE_DIR_RE.search(name)
         if m:
             direction = m.group(1)
-            if direction in ('ne', 'n'):
-                return (1, 2)
-            else:  # 'se', 'e'
-                return (2, 1)
+            if direction == 'n':
+                return (1, 1)   # compound vertical |
+            elif direction == 'ne':
+                return (1, 2)   # / diagonal
+            elif direction == 'se':
+                return (2, 1)   # \ diagonal
+            else:  # 'e'
+                return (1, 1)   # compound horizontal <><>
         # Corner, flag, sides, etc. — treat as 1x1 wall piece
         return (1, 1)
 
@@ -134,6 +138,77 @@ _BAYER_4x4 = np.array([
 _MASK_EXPAND = np.zeros(65536, dtype=np.uint32)
 for _j in range(16):
     _MASK_EXPAND += ((np.arange(65536, dtype=np.uint32) >> _j) & 1) * np.uint32(3 << (2 * _j))
+
+
+def get_gate_compound_offsets(filename, tile_hh):
+    """Get compound diamond offsets for N/E gates.
+
+    N gates use two 1x1 diamonds stacked vertically (|).
+    E gates use two 1x1 diamonds side by side horizontally (<><>).
+    Returns list of (dx, dy) offsets from center, or None for non-compound.
+    """
+    name = filename.lower()
+    if 'gate' not in name:
+        return None
+    m = _GATE_DIR_RE.search(name)
+    if not m:
+        return None
+    direction = m.group(1)
+    if direction == 'n':
+        # Vertical stack: two diamonds above/below hotspot
+        return [(0, -tile_hh), (0, tile_hh)]
+    elif direction == 'e':
+        # Horizontal stack: two diamonds left/right of hotspot
+        tile_hw = 2 * tile_hh
+        return [(-tile_hw, 0), (tile_hw, 0)]
+    return None
+
+
+def compute_compound_dither_masks(block_xs, block_ys, center_x, center_y,
+                                  tile_hh, offsets, gradient_height=0,
+                                  dither_intensity=8, dither_bottom=False):
+    """Compute dither masks for compound diamonds (union of multiple 1x1 diamonds)."""
+    if dither_intensity <= 0:
+        return np.zeros(len(block_xs), dtype=np.uint32)
+
+    M = tile_hh
+    pixel_ys = block_ys[:, None] + _PIX_ROWS[None, :]
+    pixel_xs = block_xs[:, None] + _PIX_COLS[None, :]
+
+    bayer_threshold = _BAYER_4x4[pixel_ys % 4, pixel_xs % 4]
+    bayer_pattern = bayer_threshold < dither_intensity
+    above_hotspot = pixel_ys < center_y
+
+    # A pixel is inside the union if inside ANY component diamond
+    inside_any = np.zeros_like(pixel_ys, dtype=bool)
+    below_all = np.ones_like(pixel_ys, dtype=bool)
+    for ox, oy in offsets:
+        dx = (pixel_xs - (center_x + ox)).astype(np.float64)
+        dy = (pixel_ys - (center_y + oy)).astype(np.float64)
+        top_edge = -M + np.abs(dx) * 0.5
+        bot_edge = M - np.abs(dx) * 0.5
+        inside = (dy >= top_edge) & (dy < bot_edge)
+        inside_any |= inside
+        below_all &= (dy >= bot_edge)
+
+    above_dither = above_hotspot & ~inside_any & bayer_pattern
+    if dither_bottom:
+        dither = above_dither | (below_all & bayer_pattern)
+    else:
+        dither = above_dither
+
+    return (dither.astype(np.uint32) * _BIT_VALUES[None, :]).sum(axis=1)
+
+
+def compute_compound_outline_masks(block_xs, block_ys, center_x, center_y,
+                                   tile_hh, offsets, thickness=1):
+    """Compute outline masks for compound diamonds (OR of each component's outline)."""
+    M = tile_hh
+    result = np.zeros(len(block_xs), dtype=np.uint32)
+    for ox, oy in offsets:
+        result |= compute_outline_masks(
+            block_xs, block_ys, center_x + ox, center_y + oy, M, M, thickness)
+    return result
 
 
 def compute_dither_masks(block_xs, block_ys, center_x, center_y,
@@ -621,7 +696,7 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                   outline_enabled=True, animation_protection=None,
                   full_positions=None, dither_intensity=8,
                   dither_bottom=False, contour_width=0,
-                  contour_color='team'):
+                  contour_color='team', compound_offsets=None):
     """
     Process a single SLD frame, applying dithering to layers.
 
@@ -661,13 +736,24 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
     block_xs = pos_array[:, 1]
     block_ys = pos_array[:, 2]
 
-    masks = compute_dither_masks(block_xs, block_ys, cx, cy,
-                                 margin_u, margin_v, gradient_height,
-                                 dither_intensity, dither_bottom)
+    if compound_offsets:
+        masks = compute_compound_dither_masks(block_xs, block_ys, cx, cy,
+                                              tile_hh, compound_offsets,
+                                              gradient_height, dither_intensity,
+                                              dither_bottom)
+    else:
+        masks = compute_dither_masks(block_xs, block_ys, cx, cy,
+                                     margin_u, margin_v, gradient_height,
+                                     dither_intensity, dither_bottom)
 
     if outline_enabled:
-        outline_masks = compute_outline_masks(
-            block_xs, block_ys, cx, cy, margin_u, margin_v, outline_thickness)
+        if compound_offsets:
+            outline_masks = compute_compound_outline_masks(
+                block_xs, block_ys, cx, cy, tile_hh, compound_offsets,
+                outline_thickness)
+        else:
+            outline_masks = compute_outline_masks(
+                block_xs, block_ys, cx, cy, margin_u, margin_v, outline_thickness)
     else:
         outline_masks = np.zeros(len(main_positions), dtype=np.uint32)
 
@@ -785,8 +871,16 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         # outline renders continuously around the entire diamond.
 
         # Extend horizontal bounds if diamond left/right corners exceed them
-        diamond_left = cx - (margin_u + margin_v)
-        diamond_right = cx + (margin_u + margin_v)
+        if compound_offsets:
+            # Compound: union of 1x1 diamonds at offset positions
+            M = tile_hh
+            diamond_left = min(cx + ox - 2 * M for ox, oy in compound_offsets)
+            diamond_right = max(cx + ox + 2 * M for ox, oy in compound_offsets)
+            bottom_edge_y = max(cy + oy + M for ox, oy in compound_offsets)
+        else:
+            diamond_left = cx - (margin_u + margin_v)
+            diamond_right = cx + (margin_u + margin_v)
+            bottom_edge_y = cy + max(margin_u, margin_v)
         new_x1 = min(main_layer.offset_x1, (diamond_left // 4) * 4)
         new_x2 = max(main_layer.offset_x2, ((diamond_right + 3) // 4) * 4)
         if new_x1 < main_layer.offset_x1 or new_x2 > main_layer.offset_x2:
@@ -795,7 +889,6 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
             main_positions = get_block_positions(main_layer, frame)
 
         # Extend vertical bounds if bottom diamond edge exceeds them
-        bottom_edge_y = cy + max(margin_u, margin_v)
         if bottom_edge_y > main_layer.offset_y2:
             main_layer.offset_y2 = ((bottom_edge_y + 3) // 4) * 4
 
@@ -822,8 +915,13 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         if cand_bxs:
             arr_bxs = np.array(cand_bxs, dtype=np.int32)
             arr_bys = np.array(cand_bys, dtype=np.int32)
-            cand_outlines = compute_outline_masks(
-                arr_bxs, arr_bys, cx, cy, margin_u, margin_v, outline_thickness)
+            if compound_offsets:
+                cand_outlines = compute_compound_outline_masks(
+                    arr_bxs, arr_bys, cx, cy, tile_hh, compound_offsets,
+                    outline_thickness)
+            else:
+                cand_outlines = compute_outline_masks(
+                    arr_bxs, arr_bys, cx, cy, margin_u, margin_v, outline_thickness)
 
             needed_gps = set()
             new_outline_info = []  # (bx, by, outline_mask)
@@ -915,9 +1013,14 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
         # Batch-compute any uncached masks
         if uncached:
             u_array = np.array(uncached, dtype=np.int32)
-            new_masks = compute_dither_masks(u_array[:, 1], u_array[:, 2],
-                                             cx, cy, margin_u, margin_v,
-                                             gradient_height)
+            if compound_offsets:
+                new_masks = compute_compound_dither_masks(
+                    u_array[:, 1], u_array[:, 2], cx, cy, tile_hh,
+                    compound_offsets, gradient_height)
+            else:
+                new_masks = compute_dither_masks(u_array[:, 1], u_array[:, 2],
+                                                 cx, cy, margin_u, margin_v,
+                                                 gradient_height)
             # Apply edge protection to uncached masks
             if edge_prot_cache:
                 u_prot = np.array(
@@ -937,10 +1040,14 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                      for i in range(len(uncached))], dtype=np.uint32)
                 new_masks &= ~u_contour
             if layer_type == LAYER_PLAYERCOLOR:
-                new_outlines = compute_outline_masks(
-                    u_array[:, 1], u_array[:, 2], cx, cy,
-                    margin_u, margin_v, outline_thickness,
-            )
+                if compound_offsets:
+                    new_outlines = compute_compound_outline_masks(
+                        u_array[:, 1], u_array[:, 2], cx, cy, tile_hh,
+                        compound_offsets, outline_thickness)
+                else:
+                    new_outlines = compute_outline_masks(
+                        u_array[:, 1], u_array[:, 2], cx, cy,
+                        margin_u, margin_v, outline_thickness)
                 new_masks &= ~new_outlines
             for i in range(len(uncached)):
                 m = int(new_masks[i])
@@ -1133,12 +1240,10 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
     main_layer = get_layer(sld.frames[0], LAYER_MAIN) if sld.frames else None
     layer_w = (main_layer.offset_x2 - main_layer.offset_x1) if main_layer else 0
     tiles = get_building_tiles(filename, layer_w, tile_w)
+    compound_offsets = get_gate_compound_offsets(filename, tile_hh)
 
-    # Disable outline on directional gate files (the middle gate opening)
     name_lower = filename.lower()
     outline_enabled = not no_outline
-    if outline_enabled and 'gate' in name_lower and _GATE_DIR_RE.search(name_lower):
-        outline_enabled = False
 
     # Town Center front/back variants: fully transparent since units can
     # only be blocked by the top quarter of the foundation
@@ -1176,7 +1281,8 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
                       dither_intensity=dither_intensity,
                       dither_bottom=dither_bottom,
                       contour_width=scaled_contour,
-                      contour_color=contour_color)
+                      contour_color=contour_color,
+                      compound_offsets=compound_offsets)
 
     output_data = write_sld(sld)
 

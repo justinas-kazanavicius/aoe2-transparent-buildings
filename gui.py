@@ -590,8 +590,8 @@ class TransparentBuildingsGUI:
         ttk.Button(ctrl, text=">", width=2,
                    command=self._next_building).pack(side='left', padx=(0, 12))
 
-        # Set default to house if available
-        default_file = 'b_west_house_age2_x1.sld'
+        # Set default to castle if available
+        default_file = 'b_west_castle_age4_x1.sld'
         if default_file in self._building_files:
             idx = self._building_files.index(default_file)
             self._building_combo.current(idx)
@@ -1717,7 +1717,8 @@ class TransparentBuildingsGUI:
             from sld import parse_sld, get_layer, get_block_positions, LAYER_MAIN, LAYER_PLAYERCOLOR
             from tools.sld_to_png import render_frame
             from build_mod import (
-                process_frame, get_building_tiles, TILE_HALF_HEIGHT, TILE_WIDTH
+                process_frame, get_building_tiles, get_gate_compound_offsets,
+                TILE_HALF_HEIGHT, TILE_WIDTH
             )
 
             team_rgb = TEAM_COLORS.get(self.team_color_var.get(), (0, 0, 255))
@@ -1754,6 +1755,7 @@ class TransparentBuildingsGUI:
             main_layer = get_layer(sld_mod.frames[0], LAYER_MAIN)
             layer_w = (main_layer.offset_x2 - main_layer.offset_x1) if main_layer else 0
             tiles = get_building_tiles(filename, layer_w, tile_w)
+            compound_offsets = get_gate_compound_offsets(filename, tile_hh)
 
             # Town Center front/back: fully transparent (matches process_file logic)
             name_lower = filename.lower()
@@ -1774,7 +1776,8 @@ class TransparentBuildingsGUI:
                           dither_intensity=preview_dither,
                           dither_bottom=preview_dither_bottom,
                           contour_width=contour_width,
-                          contour_color=contour_color)
+                          contour_color=contour_color,
+                          compound_offsets=compound_offsets)
 
             mod_main = render_frame(sld_mod.frames[0], LAYER_MAIN)
             mod_pc = render_frame(sld_mod.frames[0], LAYER_PLAYERCOLOR)
@@ -2242,6 +2245,7 @@ def main():
                 style.theme_use(theme)
                 break
 
+        root.state('zoomed')
         app = TransparentBuildingsGUI(root)
         root.mainloop()
     except Exception as e:
