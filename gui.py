@@ -25,18 +25,14 @@ from PIL import Image, ImageTk
 # ---------------------------------------------------------------------------
 
 GROUP_SETTINGS_KEYS = [
-    'transparency', 'dither_bottom', 'edge_inset', 'gradient_height',
-    'contour_width', 'contour_color', 'no_outline', 'outline_value',
-    'outline_thickness',
+    'transparency', 'edge_inset', 'gradient_height',
+    'no_outline', 'outline_value', 'outline_thickness',
 ]
 
 DEFAULT_GROUP_SETTINGS = {
     'transparency': 50,
-    'dither_bottom': False,
     'edge_inset': 3,
     'gradient_height': 0,
-    'contour_width': 0,
-    'contour_color': 'Team color',
     'no_outline': False,
     'outline_value': 200,
     'outline_thickness': 4,
@@ -50,7 +46,6 @@ DEFAULTS = {
     'no_outline': False,
     'workers': cpu_count(),
     'dither_intensity': 8,
-    'dither_bottom': False,
 }
 
 PRESETS_FILE = Path(__file__).parent / 'presets.json'
@@ -360,16 +355,6 @@ class TransparentBuildingsGUI:
                            _bayer_to_pct(DEFAULTS['dither_intensity']),
                            preview=True, snap_bayer=True)
 
-        self.dither_bottom_var = tk.BooleanVar(value=DEFAULTS['dither_bottom'])
-        cb = ttk.Checkbutton(left, text="Dither below foundation",
-                             variable=self.dither_bottom_var,
-                             command=self._schedule_preview)
-        cb.grid(row=row, column=0, columnspan=3, **pad, sticky='w')
-        tip = ttk.Label(left, text="Also apply dithering below the foundation line",
-                        foreground='#999999', font=('Segoe UI', 8))
-        tip.grid(row=row + 1, column=1, columnspan=2, padx=8, sticky='w')
-        row += 2
-
         row = self._slider(left, row, "Edge inset (px)",
                            "Pixels from building edge kept opaque (auto-scaled for UHD)",
                            'edge_inset', 0, 10, DEFAULTS['edge_inset'], preview=True)
@@ -379,11 +364,13 @@ class TransparentBuildingsGUI:
                            'gradient_height', 0, 32, DEFAULTS['gradient_height'],
                            preview=True)
 
-        row = self._slider(left, row, "Contour (px)",
-                           "Outline around building silhouette (0 = off)",
+        # --- Contour section (global, applies to all groups) ---
+        row = self._section(left, row, "Contour")
+
+        row = self._slider(left, row, "Width (px)",
+                           "Contour outline around building silhouette (0 = off)",
                            'contour_width', 0, 6, 0, preview=True)
 
-        # Contour color
         contour_color_frame = ttk.Frame(left)
         contour_color_frame.grid(row=row, column=0, columnspan=3, padx=8, pady=2, sticky='w')
         ttk.Label(contour_color_frame, text="Contour color:").pack(side='left', padx=(0, 8))
@@ -429,12 +416,34 @@ class TransparentBuildingsGUI:
                         variable=self.build_x2_var).pack(side='left')
         row += 1
 
-        # --- Performance section ---
-        row = self._section(left, row, "Performance")
+        # --- Advanced Settings (collapsible) ---
+        ttk.Separator(left, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', pady=(12, 4))
+        row += 1
 
-        row = self._slider(left, row, "Workers",
-                           "Parallel workers for processing",
-                           'workers', 1, cpu_count(), DEFAULTS['workers'])
+        self._adv_open = tk.BooleanVar(value=False)
+        adv_toggle = ttk.Frame(left)
+        adv_toggle.grid(row=row, column=0, columnspan=3, padx=8, pady=(0, 4), sticky='w')
+        self._adv_arrow = ttk.Label(adv_toggle, text="\u25b6", font=('Segoe UI', 9))
+        self._adv_arrow.pack(side='left')
+        adv_btn = ttk.Label(adv_toggle, text="Advanced Settings",
+                            font=('Segoe UI', 11, 'bold'), cursor='hand2')
+        adv_btn.pack(side='left', padx=(4, 0))
+        for w in (self._adv_arrow, adv_btn):
+            w.bind('<Button-1>', lambda e: self._toggle_advanced())
+        row += 1
+
+        self._adv_frame = ttk.Frame(left)
+        self._adv_frame.grid(row=row, column=0, columnspan=3, sticky='ew')
+        self._adv_frame.grid_columnconfigure(1, weight=1)
+        self._adv_row = row
+        self._adv_frame.grid_remove()  # hidden by default
+
+        adv_row = 0
+        adv_row = self._slider(self._adv_frame, adv_row, "Workers",
+                               "Parallel workers for processing",
+                               'workers', 1, cpu_count(), DEFAULTS['workers'])
+        row += 1
 
         # --- Output dir ---
         ttk.Separator(left, orient='horizontal').grid(
@@ -693,6 +702,16 @@ class TransparentBuildingsGUI:
 
         # Keep reference to prevent GC
         self._preview_photo = None
+
+    def _toggle_advanced(self):
+        if self._adv_open.get():
+            self._adv_frame.grid_remove()
+            self._adv_arrow.configure(text="\u25b6")
+            self._adv_open.set(False)
+        else:
+            self._adv_frame.grid()
+            self._adv_arrow.configure(text="\u25bc")
+            self._adv_open.set(True)
 
     def _section(self, parent, row, text):
         ttk.Separator(parent, orient='horizontal').grid(
@@ -967,11 +986,8 @@ class TransparentBuildingsGUI:
         """Snapshot current UI settings into a dict."""
         return {
             'transparency': self.transparency_var.get(),
-            'dither_bottom': self.dither_bottom_var.get(),
             'edge_inset': self.edge_inset_var.get(),
             'gradient_height': self.gradient_height_var.get(),
-            'contour_width': self.contour_width_var.get(),
-            'contour_color': self.contour_color_var.get(),
             'no_outline': self.no_outline_var.get(),
             'outline_value': self.outline_value_var.get(),
             'outline_thickness': self.outline_thickness_var.get(),
@@ -982,17 +998,14 @@ class TransparentBuildingsGUI:
         self._loading_group = True
         try:
             self.transparency_var.set(settings.get('transparency', 50))
-            self.dither_bottom_var.set(settings.get('dither_bottom', False))
             self.edge_inset_var.set(settings.get('edge_inset', 3))
             self.gradient_height_var.set(settings.get('gradient_height', 0))
-            self.contour_width_var.set(settings.get('contour_width', 0))
-            self.contour_color_var.set(settings.get('contour_color', 'Team color'))
             self.no_outline_var.set(settings.get('no_outline', False))
             self.outline_value_var.set(settings.get('outline_value', 200))
             self.outline_thickness_var.set(settings.get('outline_thickness', 4))
             # Update slider display labels
             for attr in ('transparency', 'edge_inset', 'gradient_height',
-                         'contour_width', 'outline_value', 'outline_thickness'):
+                         'outline_value', 'outline_thickness'):
                 label = getattr(self, f'{attr}_label', None)
                 var = getattr(self, f'{attr}_var', None)
                 if label and var:
@@ -1529,6 +1542,8 @@ class TransparentBuildingsGUI:
             'build_x1': self.build_x1_var.get(),
             'build_x2': self.build_x2_var.get(),
             'workers': self.workers_var.get(),
+            'contour_width': self.contour_width_var.get(),
+            'contour_color': self.contour_color_var.get(),
         }
 
         presets = _load_presets()
@@ -1556,6 +1571,8 @@ class TransparentBuildingsGUI:
                     'build_x1': True,
                     'build_x2': True,
                     'workers': cpu_count(),
+                    'contour_width': 0,
+                    'contour_color': 'Team color',
                 }
         else:
             presets = _load_presets()
@@ -1608,6 +1625,8 @@ class TransparentBuildingsGUI:
         self.build_x1_var.set(preset.get('build_x1', True))
         self.build_x2_var.set(preset.get('build_x2', True))
         self.workers_var.set(preset.get('workers', cpu_count()))
+        self.contour_width_var.set(preset.get('contour_width', 0))
+        self.contour_color_var.set(preset.get('contour_color', 'Team color'))
 
         self._schedule_preview()
 
@@ -1732,15 +1751,13 @@ class TransparentBuildingsGUI:
             gs = bld_group['settings']
 
             dither_intensity = _pct_to_bayer(gs.get('transparency', 50))
-            dither_bottom = gs.get('dither_bottom', False)
             edge_inset = gs.get('edge_inset', 3)
             gradient_height = gs.get('gradient_height', 0)
             outline_value = gs.get('outline_value', 200)
             outline_thickness = gs.get('outline_thickness', 4)
             no_outline = gs.get('no_outline', False)
-            contour_width = gs.get('contour_width', 0)
-            contour_color_str = gs.get('contour_color', 'Team color')
-            contour_color = 'team' if contour_color_str == 'Team color' else 'black'
+            contour_width = self.contour_width_var.get()
+            contour_color = 'team' if self.contour_color_var.get() == 'Team color' else 'black'
 
             # --- Render ORIGINAL (combined mod's unmodified sprite) ---
             sld_orig = parse_sld(data)
@@ -1757,13 +1774,9 @@ class TransparentBuildingsGUI:
             tiles = get_building_tiles(filename, layer_w, tile_w)
             compound_offsets = get_gate_compound_offsets(filename, tile_hh)
 
-            # Town Center front/back: normal dithering with dither below
             name_lower = filename.lower()
             preview_outline = not no_outline
             preview_dither = dither_intensity
-            preview_dither_bottom = dither_bottom
-            if 'town_center' in name_lower and ('_front' in name_lower or '_back' in name_lower):
-                preview_dither_bottom = True
 
             process_frame(sld_mod.frames[0], tile_hh, tiles,
                           outline_value=outline_value,
@@ -1772,7 +1785,7 @@ class TransparentBuildingsGUI:
                           outline_thickness=outline_thickness,
                           outline_enabled=preview_outline,
                           dither_intensity=preview_dither,
-                          dither_bottom=preview_dither_bottom,
+                          dither_bottom=True,
                           contour_width=contour_width,
                           contour_color=contour_color,
                           compound_offsets=compound_offsets)
@@ -2012,10 +2025,13 @@ class TransparentBuildingsGUI:
         self._save_current_group_settings()
 
         # Gather global settings + groups for the build
+        cc_str = self.contour_color_var.get()
         settings = {
             'workers': self.workers_var.get(),
             'output_dir': output_dir,
             'combine_mod_roots': self._get_combine_mod_roots(),
+            'contour_width': self.contour_width_var.get(),
+            'contour_color': 'team' if cc_str == 'Team color' else 'black',
             'included_files': set(self._included_files),
             'build_x1': self.build_x1_var.get(),
             'build_x2': self.build_x2_var.get(),
@@ -2127,8 +2143,6 @@ class TransparentBuildingsGUI:
                 # Per-file group settings
                 gs = self._build_settings_for_file(filename, groups)
                 di = _pct_to_bayer(gs.get('transparency', 50))
-                cc_str = gs.get('contour_color', 'Team color')
-                cc = 'team' if cc_str == 'Team color' else 'black'
                 work.append((input_path, output_path, tile_hh, tile_w,
                              gs.get('outline_value', 200),
                              gs.get('edge_inset', 3),
@@ -2136,9 +2150,9 @@ class TransparentBuildingsGUI:
                              gs.get('outline_thickness', 4),
                              gs.get('no_outline', False),
                              di,
-                             gs.get('dither_bottom', False),
-                             gs.get('contour_width', 0),
-                             cc))
+                             True,
+                             settings['contour_width'],
+                             settings['contour_color']))
 
             num_workers = settings['workers']
             done = 0

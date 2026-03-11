@@ -432,6 +432,80 @@ def compute_edge_protection(positions, edge_inset, blocks=None):
     return protection
 
 
+def compute_outer_contour(positions, contour_width, blocks=None):
+    """
+    Compute per-block 16-bit masks of pixels OUTSIDE the silhouette within
+    contour_width pixels of the edge.  Returns masks for both existing and
+    new (empty) block positions that need contour pixels.
+
+    Args:
+        positions: list of (block_idx, block_x, block_y) from get_block_positions
+        contour_width: pixels outward from silhouette edge
+        blocks: optional list of DXT1 block data for pixel-level accuracy
+
+    Returns:
+        dict: (block_x, block_y) -> uint16 contour mask
+    """
+    if contour_width <= 0 or not positions:
+        return {}
+
+    all_bx = [bx for _, bx, _ in positions]
+    all_by = [by for _, _, by in positions]
+    min_bx, max_bx = min(all_bx), max(all_bx)
+    min_by, max_by = min(all_by), max(all_by)
+
+    # Pad to accommodate outward expansion
+    pad = contour_width + 4  # extra block width for neighbor blocks
+    pixel_w = (max_bx - min_bx) + 4 + 2 * pad
+    pixel_h = (max_by - min_by) + 4 + 2 * pad
+
+    drawn = np.zeros((pixel_h, pixel_w), dtype=bool)
+    for bi, bx, by in positions:
+        px = (bx - min_bx) + pad
+        py = (by - min_by) + pad
+        if blocks and bi < len(blocks) and len(blocks[bi]) >= 8:
+            drawn[py:py+4, px:px+4] = _dxt1_opaque_mask(blocks[bi])
+        else:
+            drawn[py:py+4, px:px+4] = True
+
+    # Dilate outward by contour_width
+    dilated = drawn.copy()
+    for _ in range(contour_width):
+        expanded = np.zeros_like(dilated)
+        expanded[1:, :] |= dilated[:-1, :]
+        expanded[:-1, :] |= dilated[1:, :]
+        expanded[:, 1:] |= dilated[:, :-1]
+        expanded[:, :-1] |= dilated[:, 1:]
+        dilated = expanded | dilated
+
+    # Contour = dilated ring outside the original silhouette
+    contour = dilated & ~drawn
+
+    # Extract per-block masks — scan all block positions that could have contour pixels
+    # (existing blocks + neighbors within contour_width)
+    block_min_bx = min_bx - ((contour_width + 3) // 4) * 4
+    block_max_bx = max_bx + ((contour_width + 3) // 4) * 4
+    block_min_by = min_by - ((contour_width + 3) // 4) * 4
+    block_max_by = max_by + ((contour_width + 3) // 4) * 4
+
+    result = {}
+    bx = block_min_bx
+    while bx <= block_max_bx + 4:
+        by = block_min_by
+        while by <= block_max_by + 4:
+            px = (bx - min_bx) + pad
+            py = (by - min_by) + pad
+            if 0 <= px and px + 4 <= pixel_w and 0 <= py and py + 4 <= pixel_h:
+                block = contour[py:py+4, px:px+4].ravel()
+                if block.any():
+                    mask = int((block.astype(np.uint32) * _BIT_VALUES).sum())
+                    result[(bx, by)] = mask
+            by += 4
+        bx += 4
+
+    return result
+
+
 def inject_bc4_outline(block_data, mask_bits, value=200):
     """
     Set specific pixels in a BC4 block to a high value for team-color outline.
@@ -816,16 +890,11 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
     if outline_enabled:
         masks &= ~outline_masks
 
-    # Contour: compute contour masks early so we can exclude from dithering
+    # Contour: compute outer contour (pixels outside the silhouette)
     contour_pos_cache = {}
     contour_cache = {}
     if contour_width > 0:
-        contour_cache = compute_edge_protection(main_positions, contour_width, main_layer.blocks) or {}
-        if contour_cache:
-            contour_array = np.array(
-                [contour_cache.get((int(block_xs[i]), int(block_ys[i])), 0)
-                 for i in range(len(main_positions))], dtype=np.uint32)
-            masks &= ~contour_array
+        contour_cache = compute_outer_contour(main_positions, contour_width, main_layer.blocks) or {}
 
     # Build lookup dicts
     block_dither_masks = {}   # block_idx -> mask_bits (for main layer)
@@ -860,15 +929,18 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                 block_outline_masks[int(block_idxs[i])] = om
         _force_opaque_dxt1_batch(main_layer, block_outline_masks)
 
-    # Contour: force edge pixels to opaque in main layer + set playercolor
+    # Contour: create outer contour blocks (like outline, but around silhouette)
     if contour_cache:
+        # Apply contour to existing blocks that overlap
+        existing_pos_set = {(int(block_xs[i]), int(block_ys[i])): int(block_idxs[i])
+                            for i in range(len(main_positions))}
         block_contour_masks = {}
-        for i in range(len(main_positions)):
-            key = (int(block_xs[i]), int(block_ys[i]))
-            cm = contour_cache.get(key, 0)
-            if cm:
-                block_contour_masks[int(block_idxs[i])] = cm
-                contour_pos_cache[key] = cm
+        for (bx, by), cm in contour_cache.items():
+            bi = existing_pos_set.get((bx, by))
+            if bi is not None:
+                block_contour_masks[bi] = cm
+                contour_pos_cache[(bx, by)] = cm
+        if block_contour_masks:
             _force_opaque_dxt1_batch(main_layer, block_contour_masks)
 
     # Create new outline blocks only for full frames (not deltas).
@@ -1009,6 +1081,107 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
             if needed:
                 ensure_layer_blocks(pc_layer, frame, needed)
 
+    # Create outer contour blocks at positions outside the silhouette
+    if contour_cache and not is_delta:
+        # Widen layer bounds to fit contour positions
+        contour_bxs = [bx for bx, _ in contour_cache]
+        contour_bys = [by for _, by in contour_cache]
+        contour_x1 = min(contour_bxs)
+        contour_x2 = max(contour_bxs) + 4
+        contour_y2 = max(contour_bys) + 4
+
+        new_x1 = min(main_layer.offset_x1, (contour_x1 // 4) * 4)
+        new_x2 = max(main_layer.offset_x2, ((contour_x2 + 3) // 4) * 4)
+        if new_x1 < main_layer.offset_x1 or new_x2 > main_layer.offset_x2:
+            widen_layer_bounds(main_layer, frame, new_x1, new_x2)
+
+        if contour_y2 > main_layer.offset_y2:
+            main_layer.offset_y2 = ((contour_y2 + 3) // 4) * 4
+        contour_y1 = min(contour_bys)
+        if contour_y1 < main_layer.offset_y1:
+            main_layer.offset_y1 = (contour_y1 // 4) * 4
+
+        # Determine which contour positions need new blocks
+        current_positions = get_block_positions(main_layer, frame)
+        existing_pos = {(bx, by) for _, bx, by in current_positions}
+
+        layer_w = main_layer.offset_x2 - main_layer.offset_x1
+        blocks_per_row = (layer_w + 3) // 4
+        base_x = main_layer.offset_x1
+        base_y = main_layer.offset_y1
+
+        needed_gps = set()
+        new_contour_info = []
+        for (bx, by), cm in contour_cache.items():
+            if (bx, by) not in existing_pos:
+                col = (bx - base_x) // 4
+                row = (by - base_y) // 4
+                needed_gps.add(row * blocks_per_row + col)
+                new_contour_info.append((bx, by, cm))
+            contour_pos_cache[(bx, by)] = cm
+
+        if needed_gps:
+            ensure_layer_blocks(main_layer, frame, needed_gps)
+
+        # Patch DXT1 blocks for contour
+        all_positions = get_block_positions(main_layer, frame)
+        pos_to_bi = {(bx, by): bi for bi, bx, by in all_positions}
+
+        # New blocks: opaque gray at contour pixels, transparent elsewhere
+        new_contour_set = {(bx, by) for bx, by, _ in new_contour_info}
+        for bx, by, cm in new_contour_info:
+            bi = pos_to_bi.get((bx, by))
+            if bi is not None:
+                non_contour = (~cm) & 0xFFFF
+                tb = int(_MASK_EXPAND[non_contour])
+                main_layer.blocks[bi] = bytes([
+                    0xAA, 0x52, 0xAA, 0x52,
+                    tb & 0xFF, (tb >> 8) & 0xFF,
+                    (tb >> 16) & 0xFF, (tb >> 24) & 0xFF])
+
+        # Existing blocks: force contour pixels opaque
+        existing_contour_masks = {}
+        for (bx, by), cm in contour_cache.items():
+            if (bx, by) not in new_contour_set:
+                bi = pos_to_bi.get((bx, by))
+                if bi is not None:
+                    existing_contour_masks[bi] = cm
+        if existing_contour_masks:
+            _force_opaque_dxt1_batch(main_layer, existing_contour_masks)
+
+        # Create playercolor layer if needed
+        if get_layer(frame, LAYER_PLAYERCOLOR) is None:
+            from sld import SLDLayer
+            pc_layer = SLDLayer()
+            pc_layer.layer_type = LAYER_PLAYERCOLOR
+            pc_layer.flag1 = 0
+            pc_layer.unknown1 = 0
+            pc_layer.commands = []
+            pc_layer.command_count = 0
+            pc_layer.blocks = []
+            frame.frame_type |= LAYER_PLAYERCOLOR
+            frame.layers.append(pc_layer)
+
+        # Set playercolor for contour pixels
+        pc_layer = get_layer(frame, LAYER_PLAYERCOLOR)
+        if pc_layer is not None:
+            ensure_layer_blocks(pc_layer, frame, {
+                ((by - base_y) // 4) * blocks_per_row + ((bx - base_x) // 4)
+                for (bx, by) in contour_cache
+            })
+            pc_positions = get_block_positions(pc_layer, frame)
+            pc_pos_to_bi = {(bx, by): bi for bi, bx, by in pc_positions}
+            contour_pc_value = 255 if contour_color == 'team' else 0
+            for (bx, by), cm in contour_cache.items():
+                bi = pc_pos_to_bi.get((bx, by))
+                if bi is not None:
+                    if contour_color == 'team':
+                        pc_layer.blocks[bi] = inject_bc4_outline(
+                            pc_layer.blocks[bi], cm, contour_pc_value)
+                    else:
+                        pc_layer.blocks[bi] = zero_bc4_pixels(
+                            pc_layer.blocks[bi], cm)
+
     # Apply to other layers, reusing cached masks by position
     for layer_type in (LAYER_SHADOW, LAYER_PLAYERCOLOR, LAYER_DAMAGE):
         layer = get_layer(frame, layer_type)
@@ -1059,12 +1232,6 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
                     [animation_protection.get((int(u_array[i, 1]), int(u_array[i, 2])), 0)
                      for i in range(len(uncached))], dtype=np.uint32)
                 new_masks &= ~u_anim
-            # Exclude contour pixels from dithering
-            if contour_cache:
-                u_contour = np.array(
-                    [contour_cache.get((int(u_array[i, 1]), int(u_array[i, 2])), 0)
-                     for i in range(len(uncached))], dtype=np.uint32)
-                new_masks &= ~u_contour
             if layer_type == LAYER_PLAYERCOLOR:
                 if compound_offsets:
                     new_outlines = compute_compound_outline_masks(
@@ -1097,19 +1264,6 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
             for block_idx, omask in layer_outline_masks.items():
                 layer.blocks[block_idx] = inject_bc4_outline(
                     layer.blocks[block_idx], omask, outline_value)
-            # Contour: set edge pixels in playercolor
-            if contour_pos_cache:
-                # team=255 (full team color), black=0 (zero team color, shows base texture)
-                contour_pc_value = 255 if contour_color == 'team' else 0
-                for block_idx, block_x, block_y in positions:
-                    cm = contour_pos_cache.get((block_x, block_y), 0)
-                    if cm:
-                        if contour_color == 'team':
-                            layer.blocks[block_idx] = inject_bc4_outline(
-                                layer.blocks[block_idx], cm, contour_pc_value)
-                        else:
-                            layer.blocks[block_idx] = zero_bc4_pixels(
-                                layer.blocks[block_idx], cm)
         else:
             for block_idx, mask in layer_masks.items():
                 layer.blocks[block_idx] = zero_bc4_pixels(
