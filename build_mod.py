@@ -349,16 +349,37 @@ def compute_animation_protection(sld, threshold=0.5):
             if count >= min_draws}
 
 
-def compute_edge_protection(positions, edge_inset):
+def _dxt1_opaque_mask(block_data):
+    """Get a 4x4 boolean array of opaque pixels from a DXT1 block.
+
+    In DXT1, if color0 <= color1 (transparent mode), index 3 = transparent.
+    Otherwise all pixels are opaque.
+    """
+    c0 = block_data[0] | (block_data[1] << 8)
+    c1 = block_data[2] | (block_data[3] << 8)
+    if c0 > c1:
+        # Opaque mode: all pixels are opaque
+        return np.ones((4, 4), dtype=bool)
+    # Transparent mode: index 3 = transparent
+    indices = int.from_bytes(block_data[4:8], 'little')
+    opaque = np.ones(16, dtype=bool)
+    for i in range(16):
+        if ((indices >> (2 * i)) & 3) == 3:
+            opaque[i] = False
+    return opaque.reshape(4, 4)
+
+
+def compute_edge_protection(positions, edge_inset, blocks=None):
     """
     Compute per-block 16-bit masks of pixels within edge_inset of the silhouette edge.
 
-    Uses the drawn-block grid (from skip/draw commands) as the building silhouette,
-    then erodes it to find pixels near the edge. These pixels should be kept opaque.
+    Uses pixel-level transparency from DXT1 blocks (if provided) to accurately
+    detect the building silhouette, then erodes to find edge pixels.
 
     Args:
         positions: list of (block_idx, block_x, block_y) from get_block_positions
         edge_inset: pixels from building edge to keep opaque
+        blocks: optional list of DXT1 block data (bytes) for pixel-level accuracy
 
     Returns:
         dict: (block_x, block_y) -> uint16 protection mask (bit i = protect pixel i)
@@ -378,10 +399,15 @@ def compute_edge_protection(positions, edge_inset):
     pixel_h = (max_by - min_by) + 4 + 2 * pad
 
     drawn = np.zeros((pixel_h, pixel_w), dtype=bool)
-    for _, bx, by in positions:
+    for bi, bx, by in positions:
         px = (bx - min_bx) + pad
         py = (by - min_by) + pad
-        drawn[py:py+4, px:px+4] = True
+        if blocks and bi < len(blocks) and len(blocks[bi]) >= 8:
+            # Use actual DXT1 pixel transparency
+            drawn[py:py+4, px:px+4] = _dxt1_opaque_mask(blocks[bi])
+        else:
+            # Fallback: treat entire block as drawn
+            drawn[py:py+4, px:px+4] = True
 
     # Find boundary pixels: drawn pixels within edge_inset of the silhouette edge.
     # We erode the drawn mask by edge_inset and take the difference.
@@ -772,7 +798,7 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
             edge_positions = merged
         else:
             edge_positions = main_positions
-        edge_prot_cache = compute_edge_protection(edge_positions, edge_inset)
+        edge_prot_cache = compute_edge_protection(edge_positions, edge_inset, main_layer.blocks)
         if edge_prot_cache:
             prot_array = np.array(
                 [edge_prot_cache.get((int(block_xs[i]), int(block_ys[i])), 0)
@@ -794,7 +820,7 @@ def process_frame(frame, tile_hh, tiles, outline_value=200,
     contour_pos_cache = {}
     contour_cache = {}
     if contour_width > 0:
-        contour_cache = compute_edge_protection(main_positions, contour_width) or {}
+        contour_cache = compute_edge_protection(main_positions, contour_width, main_layer.blocks) or {}
         if contour_cache:
             contour_array = np.array(
                 [contour_cache.get((int(block_xs[i]), int(block_ys[i])), 0)
@@ -1245,12 +1271,10 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
     name_lower = filename.lower()
     outline_enabled = not no_outline
 
-    # Town Center front/back variants: fully transparent since units can
-    # only be blocked by the top quarter of the foundation
+    # Town Center front/back variants: use normal dithering with
+    # the standard TC footprint (units can walk on most of it).
     if 'town_center' in name_lower and ('_front' in name_lower or '_back' in name_lower):
-        dither_intensity = 16
         dither_bottom = True
-        outline_enabled = False
 
     # Scale pixel-based parameters for UHD (x2) resolution
     scale_factor = 2 if scale == 'x2' else 1

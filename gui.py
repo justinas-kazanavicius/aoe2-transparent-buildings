@@ -1757,15 +1757,13 @@ class TransparentBuildingsGUI:
             tiles = get_building_tiles(filename, layer_w, tile_w)
             compound_offsets = get_gate_compound_offsets(filename, tile_hh)
 
-            # Town Center front/back: fully transparent (matches process_file logic)
+            # Town Center front/back: normal dithering with dither below
             name_lower = filename.lower()
             preview_outline = not no_outline
             preview_dither = dither_intensity
             preview_dither_bottom = dither_bottom
             if 'town_center' in name_lower and ('_front' in name_lower or '_back' in name_lower):
-                preview_dither = 16
                 preview_dither_bottom = True
-                preview_outline = False
 
             process_frame(sld_mod.frames[0], tile_hh, tiles,
                           outline_value=outline_value,
