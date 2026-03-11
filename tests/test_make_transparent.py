@@ -38,10 +38,12 @@ class TestGetBuildingTiles:
         assert get_building_tiles("b_west_gate_se_age2_x1.sld", 192, 96) == (2, 1)
 
     def test_gate_n(self):
-        assert get_building_tiles("b_west_gate_n_age2_x1.sld", 192, 96) == (1, 2)
+        # N gates use compound 1x1 diamonds, so footprint is (1, 1)
+        assert get_building_tiles("b_west_gate_n_age2_x1.sld", 192, 96) == (1, 1)
 
     def test_gate_e(self):
-        assert get_building_tiles("b_west_gate_e_age2_x1.sld", 192, 96) == (2, 1)
+        # E gates use compound 1x1 diamonds, so footprint is (1, 1)
+        assert get_building_tiles("b_west_gate_e_age2_x1.sld", 192, 96) == (1, 1)
 
     def test_gate_corner(self):
         # Gate corners/flags should be 1x1
