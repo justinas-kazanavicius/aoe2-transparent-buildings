@@ -1232,10 +1232,26 @@ def find_building_files(exclude=None):
         # Skip destruction, rubble, flags, and decorative side pieces
         if '_destruction_' in name or '_rubble_' in name:
             continue
-        # Skip flag overlays (gate/wall/garrison flags) and decorative side pieces
-        # Use endswith check to avoid matching 'flagship' or 'satrapy_flags'
+        # Skip non-building overlays: gate/wall flags, waypoint flags, flagships,
+        # lanterns, satrapy decorations, and decorative side pieces
         base = name.replace('_x1.sld', '').replace('_x2.sld', '')
         if base.endswith('_flag') or '_sides' in name:
+            continue
+        if '_waypoint_flag_' in name or '_flagship_' in name or '_lantern' in name:
+            continue
+        if '_satrapy' in name:
+            continue
+        # Skip non-competitive: scenario editor, foundations, fish traps,
+        # mule carts, black tile, scenario towers
+        if name.startswith('b_scen_') or '_cart_mule_' in name or '_fish_trap' in name:
+            continue
+        if 'black_tile' in name or '_foundation' in name or '_tower_scen' in name:
+            continue
+        # Skip Return of Rome architecture sets
+        if any(prefix in name for prefix in (
+            'b_archaic_', 'b_greek_', 'b_puru_', 'b_thracian',
+            'b_spartans_', 'b_athenians_', 'b_macedonian_',
+        )):
             continue
         # Skip user-specified building types
         if any(f'_{kw}_' in name or base.endswith(f'_{kw}') for kw in exclude):
