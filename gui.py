@@ -2257,7 +2257,13 @@ def main():
                 style.theme_use(theme)
                 break
 
-        root.state('zoomed')
+        try:
+            root.state('zoomed')
+        except tk.TclError:
+            try:
+                root.attributes('-zoomed', True)
+            except tk.TclError:
+                pass
         app = TransparentBuildingsGUI(root)
         root.mainloop()
     except Exception as e:
