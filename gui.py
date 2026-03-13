@@ -27,6 +27,7 @@ from PIL import Image, ImageTk
 GROUP_SETTINGS_KEYS = [
     'transparency', 'edge_inset', 'gradient_height',
     'no_outline', 'outline_value', 'outline_thickness',
+    'cuts',
 ]
 
 DEFAULT_GROUP_SETTINGS = {
@@ -35,13 +36,14 @@ DEFAULT_GROUP_SETTINGS = {
     'gradient_height': 0,
     'no_outline': False,
     'outline_value': 200,
-    'outline_thickness': 4,
+    'outline_thickness': 2,
+    'cuts': [],
 }
 
 DEFAULTS = {
     'edge_inset': 3,
     'outline_value': 200,
-    'outline_thickness': 4,
+    'outline_thickness': 2,
     'gradient_height': 0,
     'no_outline': False,
     'workers': cpu_count(),
@@ -167,9 +169,12 @@ class TransparentBuildingsGUI:
 
         self.build_thread = None
         self._preview_pending = None  # ID from root.after()
+        self._preview_thread = None  # background thread for rendering
+        self._preview_generation = 0  # incremented on each schedule, stale results ignored
         self._sld_cache = {}  # filename -> bytes
         self._cached_source = None  # PIL Image of side-by-side composite
         self._cached_bg_tile = None
+        self._orig_cache = {}  # (filename, team, bg_key) -> (orig_img, sld_orig_frame0)
         self._loading_group = False  # flag to prevent save-while-loading
 
         # Groups: list of dicts, each with 'name', 'buildings' (list of types), 'settings'
@@ -363,6 +368,24 @@ class TransparentBuildingsGUI:
                            "Transition zone above foundation (0 = sharp cutoff)",
                            'gradient_height', 0, 32, DEFAULTS['gradient_height'],
                            preview=True)
+
+        # --- Shortening section ---
+        row = self._section(left, row, "Shortening")
+
+        self._cuts_frame = ttk.Frame(left)
+        self._cuts_frame.grid(row=row, column=0, columnspan=3, padx=8, pady=2, sticky='ew')
+        self._cuts_frame.grid_columnconfigure(1, weight=1)
+        self._cut_rows = []  # list of (frame, offset_var, height_var)
+        row += 1
+
+        cut_btn_frame = ttk.Frame(left)
+        cut_btn_frame.grid(row=row, column=0, columnspan=3, padx=8, pady=(0, 4), sticky='w')
+        ttk.Button(cut_btn_frame, text="+ Add cut", width=10,
+                   command=self._add_cut_row).pack(side='left', padx=(0, 4))
+        self._cuts_empty_label = ttk.Label(cut_btn_frame, text="No cuts (shortening off)",
+                                            foreground='#888888')
+        self._cuts_empty_label.pack(side='left')
+        row += 1
 
         # --- Contour section (global, applies to all groups) ---
         row = self._section(left, row, "Contour")
@@ -644,6 +667,11 @@ class TransparentBuildingsGUI:
         # Show before toggle
         self._show_before_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctrl, text="Before", variable=self._show_before_var,
+                        command=self._schedule_preview).pack(side='left', padx=(8, 0))
+
+        # Show cut guide lines
+        self._show_guides_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Guides", variable=self._show_guides_var,
                         command=self._schedule_preview).pack(side='left', padx=(8, 0))
 
         # Building index label + zoom + arrow key hint
@@ -982,6 +1010,87 @@ class TransparentBuildingsGUI:
     # Groups & Presets
     # ------------------------------------------------------------------
 
+    def _add_cut_row(self, offset=8, height=24, direction='bottom'):
+        """Add a cut section row to the shortening UI."""
+        idx = len(self._cut_rows)
+
+        row_frame = ttk.Frame(self._cuts_frame)
+        row_frame.grid(row=idx, column=0, columnspan=3, sticky='ew', pady=1)
+        row_frame.grid_columnconfigure(1, weight=1)
+        row_frame.grid_columnconfigure(3, weight=1)
+
+        ttk.Label(row_frame, text=f"Cut {idx + 1}:", width=5).pack(side='left')
+
+        dir_var = tk.StringVar(value=direction)
+        dir_combo = ttk.Combobox(row_frame, textvariable=dir_var,
+                                  values=['bottom', 'top'], state='readonly', width=6)
+        dir_combo.pack(side='left', padx=(2, 4))
+        dir_combo.bind('<<ComboboxSelected>>', lambda e: self._schedule_preview())
+
+        ttk.Label(row_frame, text="Offset:").pack(side='left', padx=(0, 2))
+        offset_var = tk.IntVar(value=offset)
+        offset_spin = ttk.Spinbox(row_frame, from_=0, to=600, width=5,
+                                   textvariable=offset_var,
+                                   command=self._schedule_preview)
+        offset_spin.pack(side='left')
+        offset_spin.bind('<Return>', lambda e: self._schedule_preview())
+
+        ttk.Label(row_frame, text="Height:").pack(side='left', padx=(8, 2))
+        height_var = tk.IntVar(value=height)
+        height_spin = ttk.Spinbox(row_frame, from_=0, to=600, width=5,
+                                   textvariable=height_var,
+                                   command=self._schedule_preview)
+        height_spin.pack(side='left')
+        height_spin.bind('<Return>', lambda e: self._schedule_preview())
+
+        ttk.Label(row_frame, text="px").pack(side='left', padx=(2, 4))
+
+        remove_btn = ttk.Button(row_frame, text="\u2715", width=2,
+                                 command=lambda: self._remove_cut_row(row_frame))
+        remove_btn.pack(side='left', padx=2)
+
+        self._cut_rows.append((row_frame, offset_var, height_var, dir_var))
+        self._cuts_empty_label.pack_forget()
+        self._schedule_preview()
+
+    def _remove_cut_row(self, row_frame):
+        """Remove a cut section row."""
+        self._cut_rows = [(f, o, h, d) for f, o, h, d in self._cut_rows if f is not row_frame]
+        row_frame.destroy()
+        # Re-number labels
+        for i, (f, _, _, _) in enumerate(self._cut_rows):
+            for child in f.winfo_children():
+                if isinstance(child, ttk.Label) and child.cget('text').startswith('Cut'):
+                    child.configure(text=f"Cut {i + 1}:")
+                    break
+            f.grid(row=i)
+        if not self._cut_rows:
+            self._cuts_empty_label.pack(side='left')
+        self._schedule_preview()
+
+    def _get_cuts(self):
+        """Get current cut sections as list of (offset, height, direction) tuples."""
+        return [(o.get(), h.get(), d.get()) for _, o, h, d in self._cut_rows if h.get() > 0]
+
+    def _set_cuts(self, cuts_list):
+        """Replace all cut rows with the given list."""
+        # Clear existing
+        for f, _, _, _ in self._cut_rows:
+            f.destroy()
+        self._cut_rows = []
+        if not cuts_list:
+            self._cuts_empty_label.pack(side='left')
+        else:
+            self._cuts_empty_label.pack_forget()
+        # Add new
+        for item in cuts_list:
+            if len(item) == 3:
+                offset, height, direction = item
+            else:
+                offset, height = item
+                direction = 'bottom'
+            self._add_cut_row(offset, height, direction)
+
     def _get_current_group_settings(self):
         """Snapshot current UI settings into a dict."""
         return {
@@ -991,6 +1100,7 @@ class TransparentBuildingsGUI:
             'no_outline': self.no_outline_var.get(),
             'outline_value': self.outline_value_var.get(),
             'outline_thickness': self.outline_thickness_var.get(),
+            'cuts': self._get_cuts(),
         }
 
     def _apply_group_settings(self, settings):
@@ -1003,6 +1113,11 @@ class TransparentBuildingsGUI:
             self.no_outline_var.set(settings.get('no_outline', False))
             self.outline_value_var.set(settings.get('outline_value', 200))
             self.outline_thickness_var.set(settings.get('outline_thickness', 4))
+            # Restore cuts (backward compat: convert old shorten/keep_bottom)
+            cuts = settings.get('cuts', [])
+            if not cuts and settings.get('shorten', 0) > 0:
+                cuts = [(settings.get('keep_bottom', 8), settings['shorten'])]
+            self._set_cuts(cuts)
             # Update slider display labels
             for attr in ('transparency', 'edge_inset', 'gradient_height',
                          'outline_value', 'outline_thickness'):
@@ -1653,7 +1768,8 @@ class TransparentBuildingsGUI:
         self._save_current_group_settings()
         if self._preview_pending is not None:
             self.root.after_cancel(self._preview_pending)
-        self._preview_pending = self.root.after(150, self._render_preview)
+        self._preview_generation += 1
+        self._preview_pending = self.root.after(100, self._render_preview)
 
     def _schedule_viewport(self):
         """Fast viewport update (pan/zoom only, no re-render)."""
@@ -1730,8 +1846,6 @@ class TransparentBuildingsGUI:
             self.preview_label.configure(text=f"Could not load {filename}")
             return
 
-
-
         try:
             from sld import parse_sld, get_layer, get_block_positions, LAYER_MAIN, LAYER_PLAYERCOLOR
             from tools.sld_to_png import render_frame
@@ -1739,13 +1853,15 @@ class TransparentBuildingsGUI:
                 process_frame, get_building_tiles, get_gate_compound_offsets,
                 TILE_HALF_HEIGHT, TILE_WIDTH
             )
+            from shorten import resolve_cuts, shorten_sld as _shorten_sld
 
-            team_rgb = TEAM_COLORS.get(self.team_color_var.get(), (0, 0, 255))
-            bg_spec = BACKGROUNDS.get(self.bg_var.get(), ('solid', (0x22, 0x22, 0x22)))
+            team_color_name = self.team_color_var.get()
+            team_rgb = TEAM_COLORS.get(team_color_name, (0, 0, 255))
+            bg_name = self.bg_var.get()
+            bg_spec = BACKGROUNDS.get(bg_name, ('solid', (0x22, 0x22, 0x22)))
             bg_tile = self._get_bg_tile(bg_spec)
 
             # Use the building's group settings for preview
-            # (look up original x1 filename for group matching)
             orig_filename = self._building_files[self._building_names.index(sel)]
             bld_group = self._get_group_for_building(orig_filename)
             gs = bld_group['settings']
@@ -1758,11 +1874,22 @@ class TransparentBuildingsGUI:
             no_outline = gs.get('no_outline', False)
             contour_width = self.contour_width_var.get()
             contour_color = 'team' if self.contour_color_var.get() == 'Team color' else 'black'
+            show_guides = self._show_guides_var.get()
+            show_before = self._show_before_var.get()
 
-            # --- Render ORIGINAL (combined mod's unmodified sprite) ---
-            sld_orig = parse_sld(data)
-            orig_main = render_frame(sld_orig.frames[0], LAYER_MAIN)
-            orig_pc = render_frame(sld_orig.frames[0], LAYER_PLAYERCOLOR)
+            # --- Render ORIGINAL (cached by building+team+bg) ---
+            orig_cache_key = (filename, team_color_name, bg_name)
+            cached = self._orig_cache.get(orig_cache_key)
+            if cached is not None:
+                orig_img, orig_cy, orig_cx = cached
+            else:
+                sld_orig = parse_sld(data)
+                orig_main = render_frame(sld_orig.frames[0], LAYER_MAIN)
+                orig_pc = render_frame(sld_orig.frames[0], LAYER_PLAYERCOLOR)
+                orig_img = self._composite(orig_main, orig_pc, team_rgb, bg_tile)
+                orig_cy = sld_orig.frames[0].center_y
+                orig_cx = sld_orig.frames[0].center_x
+                self._orig_cache[orig_cache_key] = (orig_img, orig_cy, orig_cx)
 
             # --- Render MODIFIED ---
             sld_mod = parse_sld(data)
@@ -1774,17 +1901,49 @@ class TransparentBuildingsGUI:
             tiles = get_building_tiles(filename, layer_w, tile_w)
             compound_offsets = get_gate_compound_offsets(filename, tile_hh)
 
-            name_lower = filename.lower()
-            preview_outline = not no_outline
-            preview_dither = dither_intensity
+            # Shortening cuts
+            raw_cuts = gs.get('cuts', [])
+            if not raw_cuts and gs.get('shorten', 0) > 0:
+                raw_cuts = [(gs.get('keep_bottom', 8), gs['shorten'])]
+
+            scale_factor = 2 if scale == 'x2' else 1
+            # Scale pixel-based parameters for UHD (x2) resolution
+            edge_inset = edge_inset * scale_factor
+            gradient_height = gradient_height * scale_factor
+            outline_thickness = outline_thickness * scale_factor
+            contour_width = contour_width * scale_factor
+            frame0 = sld_mod.frames[0]
+            margin_u = tiles[0] * tile_hh
+            margin_v = tiles[1] * tile_hh
+            # Scale raw cuts first, then resolve direction using native-scale geometry
+            scaled_raw = []
+            for item in raw_cuts:
+                if len(item) == 3:
+                    o, h, d = item
+                else:
+                    o, h = item
+                    d = 'bottom'
+                scaled_raw.append((o * scale_factor, h * scale_factor, d))
+            resolved_cuts = resolve_cuts(scaled_raw, frame0.center_y,
+                                         margin_u, margin_v)
+            scaled_cuts = [(o, h) for o, h in resolved_cuts if h > 0]
+            orig_tiles = tiles
+
+            if scaled_cuts:
+                _shorten_sld(sld_mod, tile_hh, tiles[0], tiles[1], scaled_cuts,
+                             preview_only=True)
+                main_layer = get_layer(sld_mod.frames[0], LAYER_MAIN)
+                layer_w = (main_layer.offset_x2 - main_layer.offset_x1) if main_layer else 0
+                tiles = get_building_tiles(filename, layer_w, tile_w)
+                compound_offsets = get_gate_compound_offsets(filename, tile_hh)
 
             process_frame(sld_mod.frames[0], tile_hh, tiles,
                           outline_value=outline_value,
                           edge_inset=edge_inset,
                           gradient_height=gradient_height,
                           outline_thickness=outline_thickness,
-                          outline_enabled=preview_outline,
-                          dither_intensity=preview_dither,
+                          outline_enabled=not no_outline,
+                          dither_intensity=dither_intensity,
                           dither_bottom=True,
                           contour_width=contour_width,
                           contour_color=contour_color,
@@ -1793,15 +1952,25 @@ class TransparentBuildingsGUI:
             mod_main = render_frame(sld_mod.frames[0], LAYER_MAIN)
             mod_pc = render_frame(sld_mod.frames[0], LAYER_PLAYERCOLOR)
 
-            # --- Composite both ---
-            orig_img = self._composite(orig_main, orig_pc, team_rgb, bg_tile)
+            # --- Composite ---
             mod_img = self._composite(mod_main, mod_pc, team_rgb, bg_tile)
 
+            # --- Guide lines on original ---
+            guide_orig = orig_img
+            if show_guides and scaled_cuts:
+                class _F:
+                    pass
+                ff = _F()
+                ff.center_x = orig_cx
+                ff.center_y = orig_cy
+                guide_orig = self._draw_guide_lines(
+                    orig_img, ff, tile_hh, orig_tiles, scaled_cuts)
+
             # --- Build source image at 1x (cached for fast pan/zoom) ---
-            show_before = self._show_before_var.get()
+            show_before = show_before or (show_guides and bool(scaled_cuts))
             label_h = 20
-            h = max(orig_img.shape[0], mod_img.shape[0])
-            w1, w2 = orig_img.shape[1], mod_img.shape[1]
+            h = max(guide_orig.shape[0], mod_img.shape[0])
+            w1, w2 = guide_orig.shape[1], mod_img.shape[1]
             gap = 16
 
             def _blit_rgb(canvas, img, y, x):
@@ -1822,12 +1991,11 @@ class TransparentBuildingsGUI:
                 combined_w = w2
             total_h = h + label_h
 
-            # Neutral background for outer canvas
             source = np.full((total_h, combined_w, 3), 200, dtype=np.uint8)
 
             if show_before:
-                oy = label_h + (h - orig_img.shape[0]) // 2
-                _blit_rgb(source, orig_img, oy, 0)
+                oy = label_h + (h - guide_orig.shape[0]) // 2
+                _blit_rgb(source, guide_orig, oy, 0)
                 my = label_h + (h - mod_img.shape[0]) // 2
                 _blit_rgb(source, mod_img, my, w1 + gap)
             else:
@@ -1838,8 +2006,7 @@ class TransparentBuildingsGUI:
             source_pil = Image.fromarray(source, 'RGB')
             from PIL import ImageDraw, ImageFont
             draw = ImageDraw.Draw(source_pil)
-            avg = 200  # neutral bg
-            text_color = (255, 255, 255) if avg < 128 else (0, 0, 0)
+            text_color = (0, 0, 0)
             try:
                 font = ImageFont.truetype("segoeui.ttf", 13)
             except Exception:
@@ -1854,7 +2021,8 @@ class TransparentBuildingsGUI:
             self._update_viewport()
 
         except Exception as e:
-            self.preview_label.configure(image='', text=f"Preview error:\n{e}")
+            import traceback
+            self.preview_label.configure(image='', text=f"Preview error:\n{traceback.format_exc()}")
 
     def _update_viewport(self):
         """Fast viewport update: crop/scale the cached source image for current zoom/pan."""
@@ -1997,6 +2165,56 @@ class TransparentBuildingsGUI:
 
         # Return full RGB image (terrain everywhere, building composited on top)
         return np.clip(rgb, 0, 255).astype(np.uint8)
+
+    def _draw_guide_lines(self, img, frame, tile_hh, tiles, scaled_cuts):
+        """Draw V-shaped cut zone guide lines on the image.
+
+        Draws the top and bottom edge of each cut zone as colored lines
+        following the isometric diamond angle (same V-line as the cut).
+        Also fills the cut zone with a semi-transparent color overlay.
+        """
+        img = img.copy().astype(np.float32)
+        h, w = img.shape[:2]
+        cx = frame.center_x
+        cy = frame.center_y
+        margin_u = tiles[0] * tile_hh
+        margin_v = tiles[1] * tile_hh
+
+        colors = [
+            (255, 60, 60),     # red
+            (60, 180, 255),    # blue
+            (255, 200, 40),    # yellow
+            (60, 255, 120),    # green
+        ]
+
+        # Vectorized: compute foundation top for all columns
+        cols = np.arange(w, dtype=np.float64)
+        dx = cols - cx
+        ft_arr = cy + np.maximum(-margin_u - dx * 0.5, -margin_v + dx * 0.5)
+
+        # Row indices for masking
+        rows = np.arange(h)[:, None]  # (h, 1)
+
+        for ci, (offset, height) in enumerate(scaled_cuts):
+            r, g, b = colors[ci % len(colors)]
+            fill = np.array([r, g, b], dtype=np.float32)
+            line = np.array([r, g, b], dtype=np.float32)
+
+            cut_end = np.floor(ft_arr - offset).astype(np.int32)   # (w,)
+            cut_start = cut_end - height                            # (w,)
+
+            # Fill mask: rows within [cut_start, cut_end) per column
+            fill_mask = (rows >= cut_start[None, :]) & (rows < cut_end[None, :])
+            img[fill_mask] = img[fill_mask] * 0.6 + fill * 0.4
+
+            # Line mask: 3px thick at cut_start and cut_end edges
+            for edge in (cut_start, cut_end):
+                for dy in range(-1, 2):
+                    line_mask = (rows == (edge + dy)[None, :])
+                    line_mask &= (rows >= 0) & (rows < h)
+                    img[line_mask] = line
+
+        return np.clip(img, 0, 255).astype(np.uint8)
 
     # ------------------------------------------------------------------
     # Build
@@ -2143,6 +2361,10 @@ class TransparentBuildingsGUI:
                 # Per-file group settings
                 gs = self._build_settings_for_file(filename, groups)
                 di = _pct_to_bayer(gs.get('transparency', 50))
+                # Build cuts list from group settings
+                build_cuts = gs.get('cuts', [])
+                if not build_cuts and gs.get('shorten', 0) > 0:
+                    build_cuts = [(gs.get('keep_bottom', 8), gs['shorten'])]
                 work.append((input_path, output_path, tile_hh, tile_w,
                              gs.get('outline_value', 200),
                              gs.get('edge_inset', 3),
@@ -2152,7 +2374,8 @@ class TransparentBuildingsGUI:
                              di,
                              True,
                              settings['contour_width'],
-                             settings['contour_color']))
+                             settings['contour_color'],
+                             0, 8, build_cuts or None))
 
             num_workers = settings['workers']
             done = 0

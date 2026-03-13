@@ -30,6 +30,7 @@ from sld import (
 from dxt import zero_bc4_pixels, decode_bc4_block, encode_bc4_block_from_flat, _ZERO_BLOCK
 import shutil
 
+from shorten import shorten_sld, resolve_cuts
 from paths import get_graphics_dir, get_mod_dir, get_mod_graphics_dir
 
 # Prototype test file
@@ -1391,7 +1392,8 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
                  outline_value=200, edge_inset=3, gradient_height=0,
                  outline_thickness=4, no_outline=False,
                  dither_intensity=8, dither_bottom=False,
-                 contour_width=0, contour_color='team'):
+                 contour_width=0, contour_color='team',
+                 shorten=0, keep_bottom=8, cuts=None):
     """
     Process a single SLD file, applying transparency dithering.
 
@@ -1451,6 +1453,43 @@ def process_file(input_path, output_path, tile_half_heights, tile_widths,
 
     scaled_contour = contour_width * scale_factor
 
+    # Shorten buildings before applying transparency effects
+    # Build cuts list: explicit cuts take priority, else use shorten/keep_bottom
+    if cuts:
+        # Scale raw cuts first, then resolve direction using native-scale geometry
+        frame0 = sld.frames[0] if sld.frames else None
+        if frame0:
+            margin_u = tiles[0] * tile_hh
+            margin_v = tiles[1] * tile_hh
+            scaled_raw = []
+            for item in cuts:
+                if len(item) == 3:
+                    o, h, d = item
+                else:
+                    o, h = item
+                    d = 'bottom'
+                scaled_raw.append((o * scale_factor, h * scale_factor, d))
+            resolved = resolve_cuts(scaled_raw, frame0.center_y, margin_u, margin_v)
+        else:
+            resolved = [(o * scale_factor, h * scale_factor) for o, h, *_ in cuts]
+        scaled_cuts = [(o, h) for o, h in resolved if h > 0]
+    elif shorten > 0:
+        scaled_cuts = [(keep_bottom * scale_factor, shorten * scale_factor)]
+    else:
+        scaled_cuts = []
+
+    if scaled_cuts:
+        shorten_sld(sld, tile_hh, tiles[0], tiles[1], scaled_cuts)
+        # Re-read frame 0's main layer/positions after geometry change
+        main_layer = get_layer(sld.frames[0], LAYER_MAIN) if sld.frames else None
+        frame0_positions = None
+        if sld.num_frames > 1 and main_layer is not None:
+            for f in sld.frames[1:]:
+                l = get_layer(f, LAYER_MAIN)
+                if l and (l.flag1 & 0x80):
+                    frame0_positions = get_block_positions(main_layer, sld.frames[0])
+                    break
+
     for frame in sld.frames:
         process_frame(frame, tile_hh, tiles, outline_value, scaled_edge_inset,
                       scaled_gradient_height, scaled_outline_thickness,
@@ -1476,7 +1515,7 @@ def _process_file_worker(args):
     (input_path, output_path, tile_half_heights, tile_widths,
      outline_value, edge_inset, gradient_height, outline_thickness,
      no_outline, dither_intensity, dither_bottom, contour_width,
-     contour_color) = args
+     contour_color, shorten, keep_bottom, cuts) = args
     filename = os.path.basename(input_path)
     try:
         orig_size, new_size = process_file(input_path, output_path,
@@ -1485,13 +1524,14 @@ def _process_file_worker(args):
                                            gradient_height, outline_thickness,
                                            no_outline, dither_intensity,
                                            dither_bottom, contour_width,
-                                           contour_color)
+                                           contour_color, shorten,
+                                           keep_bottom, cuts)
         return (filename, orig_size, new_size, None)
     except Exception as e:
         return (filename, 0, 0, str(e))
 
 
-DEFAULT_EXCLUDE = []
+DEFAULT_EXCLUDE = ['wonder']
 
 def find_building_files(exclude=None):
     """
@@ -1562,8 +1602,8 @@ def main():
                         help='Pixels from building edge to keep opaque, auto-scaled 2x for UHD (default: 3)')
     parser.add_argument('--gradient-height', type=int, default=0,
                         help='Transition zone height above foundation in pixels (default: 0)')
-    parser.add_argument('--outline-thickness', type=int, default=4,
-                        help='Foundation outline band height in pixels (default: 4)')
+    parser.add_argument('--outline-thickness', type=int, default=2,
+                        help='Foundation outline band height in pixels (default: 2)')
     parser.add_argument('--no-outline', action='store_true',
                         help='Disable foundation outline entirely')
     parser.add_argument('--dither-intensity', type=int, default=8,
@@ -1574,6 +1614,14 @@ def main():
                         help='Contour width in pixels around building silhouette (default: 0 = off)')
     parser.add_argument('--contour-color', type=str, default='team', choices=['team', 'black'],
                         help='Contour color: team color or black (default: team)')
+    parser.add_argument('--shorten', type=int, default=0,
+                        help='Remove HEIGHT pixels from building middles (default: 0, off)')
+    parser.add_argument('--keep-bottom', type=int, default=8,
+                        help='Pixels of wall above foundation to preserve before cut (default: 8)')
+    parser.add_argument('--cut', type=str, action='append', default=None,
+                        help='Cut section as OFFSET:HEIGHT (repeatable). '
+                             'OFFSET = px above foundation, HEIGHT = px to remove. '
+                             'Overrides --shorten/--keep-bottom when specified.')
     parser.add_argument('--exclude', type=str, nargs='*', default=None,
                         help='Building types to exclude (default: mill). Pass without args to exclude nothing.')
     parser.add_argument('--output-dir', type=str, default=None,
@@ -1591,8 +1639,10 @@ def main():
     # Output directory (can be overridden)
     output_graphics_dir = args.output_dir if args.output_dir else get_mod_graphics_dir()
 
-    # Create mod directory structure
-    os.makedirs(output_graphics_dir, exist_ok=True)
+    # Clear stale files from previous builds, then recreate
+    if os.path.isdir(output_graphics_dir):
+        shutil.rmtree(output_graphics_dir)
+    os.makedirs(output_graphics_dir)
 
     combine_mod_roots = args.combine_with or []
     for mr in combine_mod_roots:
@@ -1627,6 +1677,21 @@ def main():
     print(f"  Edge inset: {args.edge_inset}px")
     print(f"  Gradient height: {args.gradient_height}px")
     print(f"  Outline thickness: {args.outline_thickness}px")
+    # Parse cut sections
+    parsed_cuts = None
+    if args.cut:
+        parsed_cuts = []
+        for spec in args.cut:
+            try:
+                offset_s, height_s = spec.split(':')
+                parsed_cuts.append((int(offset_s), int(height_s)))
+            except ValueError:
+                print(f"Error: invalid --cut format '{spec}', expected OFFSET:HEIGHT")
+                return 1
+        for o, h in parsed_cuts:
+            print(f"  Cut: offset={o}px, height={h}px")
+    elif args.shorten > 0:
+        print(f"  Shorten: {args.shorten}px (keep bottom: {args.keep_bottom}px)")
     print()
 
     success = 0
@@ -1686,7 +1751,8 @@ def main():
                          args.outline_value, args.edge_inset, args.gradient_height,
                          args.outline_thickness, args.no_outline,
                          args.dither_intensity, args.dither_bottom,
-                         args.contour_width, args.contour_color))
+                         args.contour_width, args.contour_color,
+                         args.shorten, args.keep_bottom, parsed_cuts))
 
         if len(work) == 1:
             # Single file: direct call, no pool overhead
